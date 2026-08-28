@@ -5,8 +5,6 @@ cookies.txt
 
 # --- account state (contains real login sessions + emails) ---
 accounts/
-extensions/dola30/dola-skill-pack-response.json
-extensions/dola30/doubao-skill-pack-response.json
 
 # --- databases (API keys, task history, account metadata) ---
 *.db
@@ -26,11 +24,10 @@ downloads/
 !requirements.txt
 !README.md
 
+# --- one-off debug script (contains a signed CDN url) ---
+dl_now.py
+
 # --- python ---
 __pycache__/
 .venv/
 *.pyc
-
-# --- third-party paid extension: not ours to redistribute ---
-extensions/
-dl_now.py

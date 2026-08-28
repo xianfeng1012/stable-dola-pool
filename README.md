@@ -68,14 +68,17 @@ curl http://127.0.0.1:8000/health
 - cookie 有效期约 60 天，过期需重新登录更新 `cookies.txt`。
 - 国内版 doubao.com 对 Python HTTP 客户端有风控，本服务只跑国际版 dola.com。
 
-## 依赖的 Dola 扩展（未随仓库分发）
+## 依赖的 Dola 扩展（`extensions/dola30/`）
 
-`30 秒时长` 与 `无水印解析` 依赖一个第三方 Chromium 扩展（unpacked），放在 `extensions/dola30/`。
-该扩展是别人出售的付费资源，不包含在本仓库中，需要自备。缺少它时：
+`30 秒时长` 与 `无水印解析` 依赖一个第三方 Chromium 扩展（unpacked），已随仓库一起分发。
+运行时行为：
 
-- `duration=30` 会直接报错（`browser.py` 抛 `Dola 扩展目录不存在`）；
-- 设 `DOLA_EXTENSION_ENABLED=0` 可关闭扩展路径，只跑网页端原生支持的 5/10 秒。
+- `duration=30` 需要该扩展；缺失时 `browser.py` 抛 `Dola 扩展目录不存在`；
+- 设 `DOLA_EXTENSION_ENABLED=0` 可关闭扩展加载路径，只跑网页端原生支持的 5/10 秒；
+- 路径可用 `DOLA_EXTENSION_DIR` 覆盖（默认 `extensions/dola30`）；
+- `dola-skill-pack-response.json` / `doubao-skill-pack-response.json` 是扩展拦截并伪造 skill-pack 响应所需的固定数据，删掉会导致时长解锁失效。
+
 
 ## 免责声明
 
-本仓库是个人学习与互操作性研究记录，包含对上游网页接口的逆向实现；代码不含任何账号、cookie、密钥或可用凭据。使用者自行评估账号与合规风险。
+本仓库是个人学习与互操作性研究记录，包含对上游网页接口的逆向实现；代码不含任何账号、cookie、密钥或可用凭据。`extensions/dola30/` 为第三方扩展，按购买者意愿随仓库附带，其授权与使用权归原作者，使用者自行评估账号与合规风险。
