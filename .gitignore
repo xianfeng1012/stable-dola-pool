@@ -1,0 +1,36 @@
+# --- secrets / local config ---
+.env.local
+cookies.txt
+*.log
+
+# --- account state (contains real login sessions + emails) ---
+accounts/
+extensions/dola30/dola-skill-pack-response.json
+extensions/dola30/doubao-skill-pack-response.json
+
+# --- databases (API keys, task history, account metadata) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- generated media ---
+downloads/
+
+# --- probe / debug artifacts (contain live session snippets) ---
+/*.html
+/*.png
+/*.jpg
+/*.json
+/*.txt
+!requirements.txt
+!README.md
+
+# --- python ---
+__pycache__/
+.venv/
+*.pyc
+
+# --- third-party paid extension: not ours to redistribute ---
+extensions/
+dl_now.py
