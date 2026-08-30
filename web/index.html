@@ -215,7 +215,7 @@ async function loadDash(){
       accLabel(a),
       statusBadge(a),
       `<label class="sw"><input type="checkbox" ${a.scheduling?'checked':''} onchange="setSched('${a.name}',this.checked)"><i></i></label>`,
-      `<b>${a.used_today}</b> / ${a.limit}<span class="tiny">（记录值）</span>`,
+      `<b>${a.remaining}</b> / ${a.limit}<span class="tiny">（剩余/上限）</span>`,
       a.completed_total||0,
       fmt(a.last_used_at)
     ])
@@ -257,7 +257,7 @@ async function loadAccounts(){
       accLabel(x)+warn,
       badge,
       `<label class="sw"><input type="checkbox" ${x.scheduling?'checked':''} onchange="setSched('${x.name}',this.checked)"><i></i></label>`,
-      `<b>${x.used_today}</b> / ${x.limit}`,
+      `<b>${x.remaining}</b> / ${x.limit}`,
       fmt(x.last_used_at),
       fmt(x.created_at),
       `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">验证</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">删除</button>`

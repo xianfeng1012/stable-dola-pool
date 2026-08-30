@@ -8,6 +8,7 @@
 管理面板：GET / -> web/index.html；管理接口 /api/admin/*。
 """
 import asyncio
+import aiohttp
 import hashlib
 import json
 import re
@@ -17,7 +18,7 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -348,7 +349,42 @@ async def get_video(task_id: str, authorization: str | None = Header(default=Non
     )
 
 
+
+@app.get("/v1/videos/{task_id}/content")
+async def get_video_content(task_id: str, authorization: str | None = Header(default=None)):
+    """new-api 任务插件兼容端点：把已完成的视频文件内容返回给客户端。"""
+    client = _auth(authorization)
+    row = store.get_for_client(task_id, client["api_key_hash"])
+    if not row:
+        raise HTTPException(404, "task not found")
+    if row["status"] != "completed" or not row["video_url"]:
+        raise HTTPException(409, "video not ready")
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(row["video_url"]) as resp:
+            if resp.status != 200:
+                raise HTTPException(502, "failed to fetch video from upstream")
+            content_type = resp.headers.get("Content-Type", "video/mp4")
+            data = await resp.read()
+    return Response(content=data, media_type=content_type)
+
+
+
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI 风格模型列表，供 new-api 等上游获取模型用。"""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "seedance-2.0", "object": "model", "owned_by": "dola-pool", "created": 0},
+            {"id": "seedance-2.5", "object": "model", "owned_by": "dola-pool", "created": 0},
+        ],
+    }
+
+
 @app.get("/health")
+
+
 async def health():
     return {
         "ok": True,

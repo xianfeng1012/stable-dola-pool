@@ -65,6 +65,9 @@ LIMIT_RESET_TZ = os.getenv("DOLA_LIMIT_RESET_TZ", "Asia/Tokyo")
 # 生成前余额预检的保守最低积分；Dola 当前 2.5/30s 实测成本为 2。
 VIDEO_REQUIRED_POINTS = int(os.getenv("DOLA_VIDEO_REQUIRED_POINTS", "2"))
 
+# 每账号每日视频生成上限（官方每日免费额度随账号/区域浮动，超出后 Dola 会返回每日上限错误自动停号）
+DAILY_LIMIT = int(os.getenv("DOLA_DAILY_LIMIT", "4"))
+
 
 # 公网参考图片下载限制
 REFERENCE_IMAGE_MAX_BYTES = int(os.getenv("DOLA_REFERENCE_IMAGE_MAX_BYTES", str(15 * 1024 * 1024)))

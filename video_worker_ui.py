@@ -47,6 +47,24 @@ VIDEO_BTN = "text=動画を作成"          # ja-JP locale 下的入口文案
 CAPTCHA_FRAME_KEY = "bdcaptcha.html"   # 字节 verifycenter 滑块 iframe
 
 
+async def dismiss_popups(page):
+    """关闭 Cookie 同意、桌面应用推广等可能拦截点击的弹层。"""
+    for sel in ("OK", "同意する", "Accept All", "閉じる", "Close"):
+        try:
+            loc = page.get_by_text(sel, exact=True).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=1500)
+                break
+        except Exception:
+            continue
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    await page.wait_for_timeout(500)
+
+
+
 # 生成前只读检查：读取最近会话中的“剩余 N points/ポイント/积分”文案。
 # 新账号如果没有历史余额文案，返回 balance=null，交给实际提交流程判断，不误拦截。
 BALANCE_JS = r"""
@@ -381,12 +399,17 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
             page = context.pages[0] if context.pages else await context.new_page()
             await page.goto("https://www.dola.com/chat", timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
+            await dismiss_popups(page)
             cookies = await context.cookies("https://www.dola.com")
             ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
             await _preflight_balance(page, ms_token, fp, config.VIDEO_REQUIRED_POINTS)
 
             # ---- UI 发送 ----
-            await page.click(VIDEO_BTN)
+            try:
+                await page.click(VIDEO_BTN)
+            except Exception:
+                await page.get_by_text("動画を作成", exact=False).first.evaluate("(el) => el.click()")
+                await page.wait_for_timeout(500)
             await page.wait_for_timeout(1500)
             if reference_image_paths:
                 await attach_reference_images(page, reference_image_paths)
@@ -409,7 +432,12 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
                 for option_text in options:
                     loc = page.get_by_text(option_text, exact=False).first
                     if await loc.count() and await loc.is_visible():
-                        await loc.click(timeout=5000)
+                        try:
+                            await loc.click(timeout=5000)
+                        except Exception:
+                            # radix popper 子元素拦截点击时，用 JS 直接派发点击
+                            await loc.evaluate("(el) => el.click()")
+                            await page.wait_for_timeout(300)
                         selected = True
                         break
                 if not selected:
@@ -434,8 +462,12 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
                         await page.click(f"text={duration}s", timeout=3000)
                     except Exception as e:
                         print(f"  (设置时长失败，用默认: {str(e)[:80]})", flush=True)
+            await dismiss_popups(page)
             box = await page.query_selector("textarea") or await page.query_selector('[contenteditable="true"]')
-            await box.click()
+            try:
+                await box.click()
+            except Exception:
+                await box.evaluate("(el) => el.focus()")
             await page.keyboard.type(prompt, delay=100)
             await page.wait_for_timeout(600)
             await page.keyboard.press("Enter")

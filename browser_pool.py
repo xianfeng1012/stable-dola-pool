@@ -17,7 +17,7 @@ from video_worker_ui import (
 )
 import config
 
-DAILY_LIMIT = 2
+DAILY_LIMIT = config.DAILY_LIMIT
 COOLDOWN_SEC = 1800  # 风控冷却 30 分钟
 
 
