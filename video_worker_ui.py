@@ -311,12 +311,12 @@ async def _preflight_balance(page, ms_token: str, fp: str, required: int) -> dic
 
 async def poll_conversation(account: str, page, context, conversation_id: str,
                             timeout: int, on_poll=None, on_balance=None) -> dict:
-    """轮询已受理会话；可被初次提交和服务重启恢复流程共同调用。"""
+    """轮询已受理会话直到出片（不限时）；可被初次提交和服务重启恢复流程共同调用。"""
     cookies = await context.cookies("https://www.dola.com")
     ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
     start = time.time()
     last_callback = 0.0
-    while time.time() - start < timeout:
+    while True:
         await asyncio.sleep(5)
         try:
             poll = await asyncio.wait_for(page.evaluate(
@@ -346,7 +346,6 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
             return {"video_url": url, "local_path": str(local),
                     "conversation_id": conversation_id, "account": account}
         print(f"  ...生成中（{int(time.time() - start)}s）", flush=True)
-    raise TimeoutError(f"{timeout}s 内未出片（conversation_id={conversation_id}）")
 
 
 async def resume_video(account: str, conversation_id: str, timeout: int,
@@ -372,7 +371,7 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
     """完整出片流程（UI 流）。返回 {"video_url","local_path","conversation_id","account"}。
 
     ratio/duration: None = 用 UI 默认（当前默认 10s）。
-    异常：RiskControlError（滑块 3 次不过）、CreditError（额度不足）、TimeoutError。
+    异常：RiskControlError（滑块 3 次不过）、CreditError（额度不足）。出片轮询不限时。
     """
     timeout = timeout or config.VIDEO_TIMEOUT
     model_key = model.lower().replace("-", "_")
