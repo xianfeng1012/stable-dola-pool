@@ -178,6 +178,37 @@ def _resolve_ratio(size, ratio):
     return ratio
 
 
+def _normalize_model(model: str) -> str:
+    """把火山 Ark 的模型 ID 宽松映射到 dola-pool 支持的 seedance 版本。"""
+    m = (model or "").lower().replace("_", "-")
+    if "2.5" in m or "2-5" in m:
+        return "seedance-2.5"
+    return "seedance-2.0"
+
+
+def _pick_duration(requested, allowed: list[int]) -> int:
+    """把 Ark 请求的时长映射到 dola 支持的 10/15/30，优先取不小于请求值的档位。"""
+    try:
+        requested = max(1, int(requested or 0))
+    except (TypeError, ValueError):
+        requested = 10
+    allowed = sorted(allowed) or list(SUPPORTED_DURATIONS)
+    for duration in allowed:
+        if duration >= requested:
+            return duration
+    return allowed[-1]
+
+
+def _map_ark_ratio(ratio) -> str | None:
+    """Ark 的 ratio 直接透传；adaptive/未知值回落 dola 默认。"""
+    if not ratio:
+        return None
+    value = str(ratio).strip().lower()
+    if value in ("adaptive", "auto", "default"):
+        return None
+    return value if value in {"16:9", "9:16", "1:1", "4:3", "3:4"} else None
+
+
 async def _run_task(task_id, model, prompt, ratio, duration, reference_images, client):
     api_key_hash = client.get("api_key_hash")
     acquired = False
@@ -289,18 +320,24 @@ async def resume_incomplete_tasks():
 async def create_video(req: VideoGenRequest, authorization: str | None = Header(default=None)):
     client = _auth(authorization)
     duration = req.duration or 10
+    ratio = _resolve_ratio(req.size, req.ratio)
+    return await _submit_task(client, req.model, req.prompt, ratio, duration, req.reference_images)
+
+
+async def _submit_task(client, model, prompt, ratio, duration, reference_images):
+    """公共受理逻辑：校验模型/时长/账号池 -> 入队 -> 后台跑，返回 TaskResponse。"""
     if duration not in SUPPORTED_DURATIONS:
         raise HTTPException(422, "当前固定支持 10 秒、15 秒和 30 秒视频")
     if duration not in client["allowed_durations"]:
         raise HTTPException(422, f"当前 API Key 不允许生成 {duration} 秒视频")
-    model_key = req.model.lower().replace("-", "_")
+    model_key = model.lower().replace("-", "_")
     if model_key not in (
         "seedance_2.0", "seedance_2.5", "seedance_v2.0", "seedance_v2.5",
         "seedance_20", "seedance_25", "seedance_v20", "seedance_v25",
     ):
         raise HTTPException(422, "当前支持的模型为 seedance-2.0 和 seedance-2.5")
     try:
-        reference_images = await validate_reference_urls(req.reference_images)
+        reference_images = await validate_reference_urls(reference_images)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     # 账号暂时忙时允许任务进入 queued，由 BrowserPool 的全局并发控制实际排队。
@@ -312,12 +349,11 @@ async def create_video(req: VideoGenRequest, authorization: str | None = Header(
     if not pool.accounts:
         raise HTTPException(503, "no account in pool")
     task_id = "video_" + uuid.uuid4().hex
-    ratio = _resolve_ratio(req.size, req.ratio)
     try:
         store.create(
             task_id,
-            req.model,
-            req.prompt,
+            model,
+            prompt,
             ratio or "default",
             duration,
             reference_images=json.dumps(reference_images, ensure_ascii=False),
@@ -332,9 +368,9 @@ async def create_video(req: VideoGenRequest, authorization: str | None = Header(
     except PendingTaskLimitExceeded as exc:
         raise HTTPException(429, str(exc)) from exc
     asyncio.create_task(_run_task(
-        task_id, req.model, req.prompt, ratio, duration, reference_images, client
+        task_id, model, prompt, ratio, duration, reference_images, client
     ))
-    return TaskResponse(id=task_id, status="queued", model=req.model, prompt=req.prompt)
+    return TaskResponse(id=task_id, status="queued", model=model, prompt=prompt)
 
 
 @app.get("/v1/videos/{task_id}", response_model=TaskResponse)
@@ -380,6 +416,76 @@ async def list_models():
             {"id": "seedance-2.5", "object": "model", "owned_by": "dola-pool", "created": 0},
         ],
     }
+
+
+# ===== 火山 Ark 任务式协议兼容端点（画布工具） =====
+
+ARK_STATUS_MAP = {
+    "queued": "queued",
+    "processing": "running",
+    "completed": "succeeded",
+    "failed": "failed",
+}
+
+
+async def ark_create_task(body: dict, authorization: str | None = Header(default=None)):
+    """POST .../contents/generations/tasks：Ark 风格创建，复用 dola 出片流程。"""
+    client = _auth(authorization)
+    body = body or {}
+    prompt_parts: list[str] = []
+    reference_images: list[str] = []
+    for item in body.get("content") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "text":
+            text = str(item.get("text") or "").strip()
+            if text:
+                prompt_parts.append(text)
+        elif item_type in ("image_url", "image"):
+            url_obj = item.get("image_url")
+            url = url_obj.get("url") if isinstance(url_obj, dict) else url_obj
+            if isinstance(url, str) and url.strip():
+                reference_images.append(url.strip())
+    prompt = "\n".join(prompt_parts).strip()
+    if not prompt:
+        raise HTTPException(422, "content 中缺少 text 提示词")
+    model = _normalize_model(body.get("model"))
+    ratio = _map_ark_ratio(body.get("ratio"))
+    duration = _pick_duration(body.get("duration"), client["allowed_durations"])
+    resp = await _submit_task(client, model, prompt, ratio, duration, reference_images)
+    return {"id": resp.id, "status": resp.status}
+
+
+async def ark_get_task(task_id: str, authorization: str | None = Header(default=None)):
+    """GET .../contents/generations/tasks/{id}：Ark 风格查询。"""
+    client = _auth(authorization)
+    row = store.get_for_client(task_id, client["api_key_hash"])
+    if not row:
+        raise HTTPException(404, "task not found")
+    result = {
+        "id": row["id"],
+        "model": row["model"],
+        "status": ARK_STATUS_MAP.get(row["status"], row["status"]),
+        "created_at": int(row["created_at"]),
+        "updated_at": int(row.get("updated_at") or row["created_at"]),
+    }
+    if row["status"] == "completed" and row.get("video_url"):
+        result["content"] = {"video_url": row["video_url"]}
+    if row.get("error"):
+        result["error"] = row["error"]
+    return result
+
+
+ARK_TASK_PATHS = (
+    "/v1/video/contents/generations/tasks",
+    "/api/v3/contents/generations/tasks",
+    "/v1/contents/generations/tasks",
+    "/seedance/v3/contents/generations/tasks",
+)
+for _ark_path in ARK_TASK_PATHS:
+    app.add_api_route(_ark_path, ark_create_task, methods=["POST"])
+    app.add_api_route(_ark_path + "/{task_id}", ark_get_task, methods=["GET"])
 
 
 @app.get("/health")
@@ -599,4 +705,3 @@ async def admin_key_delete(key: str, x_admin_key: str | None = Header(default=No
 
 # 面板单文件前端（放最后，保证上面的路由优先）
 app.mount("/", StaticFiles(directory="web", html=True), name="web")
-
