@@ -12,6 +12,14 @@ LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
+    # ---- 内存优化（2026-08-31，服务器内存紧张无法升级）----
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-component-update",
+    "--disable-background-networking",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",
+    "--disable-features=Translate,MediaRouter,BackForwardCache",
 ]
 
 

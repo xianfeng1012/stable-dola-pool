@@ -40,6 +40,8 @@ app.mount("/videos", StaticFiles(directory=config.DOWNLOAD_DIR), name="videos")
 
 # 后台 jobs（加号/验证），内存态
 JOBS: dict[str, dict] = {}
+# 加号并发上限：1.9GB 内存机器上同时开多个浏览器登录会 OOM，批量添加时逐个排队登录
+ADD_ACCOUNT_SEM = asyncio.Semaphore(1)
 
 SIZE_TO_RATIO = {
     "1280x720": "16:9", "1920x1080": "16:9",
@@ -269,7 +271,9 @@ async def _resume_task(row: dict):
             store.update(task_id, last_poll_at=now)
 
         result = await pool.resume_video(
-            row["account"], row["conversation_id"], remaining, on_poll=on_poll)
+            row["account"], row["conversation_id"], remaining, on_poll=on_poll,
+            duration=row.get("duration"),
+            ratio=None if row.get("ratio") == "default" else row.get("ratio"))
         public_url = f"{config.PUBLIC_BASE}/videos/{Path(result['local_path']).name}"
         store.update(task_id, status="completed", video_url=public_url,
                      account=result.get("account"), last_poll_at=time.time(),
@@ -595,7 +599,8 @@ async def admin_account_verify(name: str, x_admin_key: str | None = Header(defau
 async def _run_add_job(name: str, email: str, password: str, totp: str):
     JOBS[name] = {"kind": "add", "status": "running", "error": "", "started_at": time.time()}
     try:
-        await add_account_flow(name, email, password, totp)
+        async with ADD_ACCOUNT_SEM:
+            await add_account_flow(name, email, password, totp)
         pool.set_email(name, email)
         pool.set_login_status(name, True)
         JOBS[name] = {**JOBS[name], "status": "success"}

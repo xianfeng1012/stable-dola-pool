@@ -34,6 +34,52 @@ DAILY_LIMIT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Dola 提交被拒绝/未真正出片时的终结性文字（2026-08-31 实测：提交后只回文字、永远无视频）：
+# - 时长选择提问："A. 5 秒で生成 B. 10 秒で生成 ..." / "秒数は 4～15 秒から選んでください"
+# - 无法生成视频："現時点では動画生成はできません" / "supports durations from ..."
+# 注意：不要把 "生成された動画：..." 占位文字当终结信号——正常生成期间它也会出现。
+TERMINAL_TEXT_PATTERNS = [
+    re.compile(
+        r"supports durations from|nearest supported duration|対応可能な時間|最寄りの対応可能|"
+        r"動画生成には|秒で生成|秒数は|から選んで|選んでください|選んで下さい|A/B/C で選んで|"
+        r"動画生成はできません|動画を生成できません|動画生成は現在|video generation (?:is )?not possible",
+        re.IGNORECASE,
+    ),
+]
+# 正常受理文案：出现则说明 Dola 已开始生成，重置终结计数（避免把提问/占位文字误判为失败）
+ACCEPTANCE_TEXT_PATTERN = re.compile(
+    r"生成されます|5 分後に完成|ポイントを消費|を生成します|ビデオを生成|動画を生成|生成を開始",
+    re.IGNORECASE,
+)
+# 连续 N 次轮询（每次约 5s）都只有终结性文字且无视频 → 判定提交失败，不再无限轮询
+TERMINAL_TEXT_MAX_HITS = 12
+
+# Dola 新版提交流程（2026-08-31 实测）：提交提示词后要求回复 A/B/C 选择时长，例如
+# "A. 5 秒で生成  B. 10 秒で生成  C. 15 秒で生成  A/B/C で選んでください。"
+DURATION_CHOICE_RE = re.compile(r"([A-Da-d])\s*[.．、)）\]]?\s*(\d+)\s*秒", re.IGNORECASE)
+DURATION_CHOICE_QUESTION_RE = re.compile(
+    r"動画生成には|秒で生成|A/B/C で選んで|supports durations from|nearest supported duration|"
+    r"秒数は|から選んで|選んでください|選んで下さい|choose.*duration|select.*duration",
+    re.IGNORECASE,
+)
+
+
+def _build_duration_reply(text: str, duration: int | None, ratio: str | None) -> str | None:
+    """构造时长选择的回复：
+    格式1（A. 5 秒で生成 / B. 10 秒で生成 / C. 15 秒で生成）→ 回完整选项文本（实测裸 "B" 会报错，
+    "B. 10秒" 才被接受）；
+    格式2（例：・16:9、10秒）→ 回「比例、N秒」。
+    """
+    if not text or not duration:
+        return None
+    letter_matches = list(DURATION_CHOICE_RE.finditer(text))
+    if letter_matches:
+        for m in letter_matches:
+            if int(m.group(2)) == duration:
+                return f"{m.group(1).upper()}. {duration}秒"
+        return None  # 有字母选项但没有匹配时长 → 无法满足，交给终结检测快速失败
+    return f"{ratio or '16:9'}、{duration}秒"
+
 
 class AccountLimitedError(Exception):
     """当前 Dola 账号达到每日视频生成上限，应立即换下一个账号。"""
@@ -310,12 +356,17 @@ async def _preflight_balance(page, ms_token: str, fp: str, required: int) -> dic
 
 
 async def poll_conversation(account: str, page, context, conversation_id: str,
-                            timeout: int, on_poll=None, on_balance=None) -> dict:
+                            timeout: int, on_poll=None, on_balance=None,
+                            duration: int | None = None,
+                            ratio: str | None = None) -> dict:
     """轮询已受理会话直到出片（不限时）；可被初次提交和服务重启恢复流程共同调用。"""
     cookies = await context.cookies("https://www.dola.com")
     ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
     start = time.time()
     last_callback = 0.0
+    terminal_hits = 0
+    last_terminal_text = ""
+    choice_replied = False
     while True:
         await asyncio.sleep(5)
         try:
@@ -328,7 +379,28 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
         if on_poll and now - last_callback >= 30:
             on_poll(now)
             last_callback = now
-        for text in poll.get("texts", []):
+        texts = poll.get("texts") or []
+        videos = poll.get("videos") or []
+        # ---- 新版 Dola：提交后要求 A/B/C 选择时长，不回复则永远不出片 ----
+        if duration and not choice_replied:
+            joined = "\n".join(texts)
+            if DURATION_CHOICE_QUESTION_RE.search(joined):
+                reply = _build_duration_reply(joined, duration, ratio)
+                if reply:
+                    box = await page.query_selector("textarea") or await page.query_selector('[contenteditable="true"]')
+                    if box:
+                        try:
+                            await box.click()
+                            await page.keyboard.type(reply, delay=120)
+                            await page.wait_for_timeout(300)
+                            await page.keyboard.press("Enter")
+                            choice_replied = True
+                            print(f"[{account}] 已回复时长选择: {reply}（{duration}s）", flush=True)
+                        except Exception as e:
+                            print(f"[{account}] 回复时长选择失败: {str(e)[:100]}", flush=True)
+        terminal_now = False
+        acceptance_now = False
+        for text in texts:
             balance, _, source = _parse_balance_texts([text])
             if balance is not None and on_balance:
                 on_balance(balance, source)
@@ -336,10 +408,24 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
                 raise AccountLimitedError(f"账号每日生成上限: {text[:120]}")
             if CREDIT_FAIL_PATTERN.search(text):
                 raise CreditError(f"额度不足: {text[:80]}")
-        if poll.get("videos"):
+            if ACCEPTANCE_TEXT_PATTERN.search(text):
+                acceptance_now = True
+            if not terminal_now and any(p.search(text) for p in TERMINAL_TEXT_PATTERNS):
+                terminal_now = True
+                last_terminal_text = text
+        if not videos and terminal_now and not acceptance_now:
+            terminal_hits += 1
+        else:
+            terminal_hits = 0
+        if terminal_hits >= TERMINAL_TEXT_MAX_HITS:
+            raise RuntimeError(
+                f"Dola 未真正出片（连续收到终结性文字回复且无视频，疑似提交失败）: "
+                f"{last_terminal_text[:150]}"
+            )
+        if videos:
             video_models = poll.get("videoModels", [])
             url = extract_unwatermarked_url(
-                video_models[0] if video_models else "", poll["videos"][0])
+                video_models[0] if video_models else "", videos[0])
             print(f"[{account}] 出片! 下载中（无水印优先）...", flush=True)
             local = await _download(url, account)
             print(f"[{account}] 已下载 {local}（{local.stat().st_size / 1e6:.1f} MB）", flush=True)
@@ -349,7 +435,8 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
 
 
 async def resume_video(account: str, conversation_id: str, timeout: int,
-                       on_poll=None, on_balance=None) -> dict:
+                       on_poll=None, on_balance=None, duration: int | None = None,
+                       ratio: str | None = None) -> dict:
     """服务重启后恢复一个已受理会话，不重新发送 prompt。"""
     async with async_playwright() as p:
         context = await launch_account_context(p, account, headless=False, use_extension=True)
@@ -358,7 +445,9 @@ async def resume_video(account: str, conversation_id: str, timeout: int,
             await page.goto(f"https://www.dola.com/chat/{conversation_id}",
                             timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
-            return await poll_conversation(account, page, context, conversation_id, timeout, on_poll, on_balance)
+            return await poll_conversation(
+                account, page, context, conversation_id, timeout, on_poll, on_balance,
+                duration, ratio)
         finally:
             await context.close()
 
@@ -511,7 +600,9 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
             deadline = time.time() + timeout
             if on_conversation_id:
                 on_conversation_id(account, conv_id, deadline)
-            return await poll_conversation(account, page, context, conv_id, timeout, on_poll, on_balance)
+            return await poll_conversation(
+                account, page, context, conv_id, timeout, on_poll, on_balance,
+                duration, ratio)
         finally:
             await context.close()
 

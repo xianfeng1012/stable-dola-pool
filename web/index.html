@@ -111,7 +111,11 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
     <div class="card">
       <div class="toolbar">
         <h3 style="margin:0">账号列表</h3>
-        <button class="btn btn-p" onclick="openAddAccount()">＋ 添加账号</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-danger" id="btnDelSel" onclick="delSelected()" disabled>删除选中</button>
+          <button class="btn" onclick="openBatchAdd()">＋ 批量添加</button>
+          <button class="btn btn-p" onclick="openAddAccount()">＋ 添加账号</button>
+        </div>
       </div>
       <div id="accountsTable"></div>
     </div>
@@ -243,6 +247,7 @@ async function setSched(name,on){
 }
 
 /* ---- 账号管理 ---- */
+let selAccounts=new Set();
 async function loadAccounts(){
   const [a,j]=await Promise.all([api('/api/admin/accounts'),api('/api/admin/jobs')]);
   const jobs=j.jobs||{};
@@ -253,6 +258,7 @@ async function loadAccounts(){
       :statusBadge(x);
     const warn=(jb&&jb.status==='failed')?' <span class="tiny" title="'+esc(jb.error)+'">⚠</span>':'';
     return [
+      `<input type="checkbox" data-name="${esc(x.name)}" ${selAccounts.has(x.name)?'checked':''} onchange="toggleSel('${x.name}',this.checked)">`,
       `<span class="account-id">${esc(x.name)}</span>`,
       accLabel(x)+warn,
       badge,
@@ -263,7 +269,9 @@ async function loadAccounts(){
       `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">验证</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">删除</button>`
     ];
   });
-  q('#accountsTable').innerHTML=table(['内部账号','名称','状态','调度','今日剩余','最近使用','创建时间','操作'],rows);
+  q('#accountsTable').innerHTML=table(['选择','内部账号','名称','状态','调度','今日剩余','最近使用','创建时间','操作'],rows);
+  const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
+  b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
 }
 
 async function verify(name,btn){
@@ -277,6 +285,79 @@ async function verify(name,btn){
 async function delAccount(name){
   if(!confirm('确定删除账号 '+name+'？将同时删除其 profile。'))return;
   try{await api('/api/admin/accounts/'+name,{method:'DELETE'});}catch(e){alert(e.message);}refresh();
+}
+
+function toggleSel(name,on){
+  if(on)selAccounts.add(name);else selAccounts.delete(name);
+  const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
+  b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
+}
+
+async function delSelected(){
+  const list=[...selAccounts];
+  if(!list.length)return;
+  if(!confirm(`确定删除选中的 ${list.length} 个账号？将同时删除其 profile。`))return;
+  let ok=0;
+  for(const name of list){
+    try{await api('/api/admin/accounts/'+encodeURIComponent(name),{method:'DELETE'});ok++;}
+    catch(e){alert(name+' 删除失败：'+e.message);}
+  }
+  selAccounts.clear();
+  refresh();
+  if(ok)alert(`已删除 ${ok} 个账号`);
+}
+
+function openBatchAdd(){
+  showDlg(`<h2>批量添加账号</h2>
+    <label>账号列表（每行一个，也可用 | 或 ; 分隔多个）</label>
+    <textarea id="f_batch" rows="10" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:ui-monospace,Consolas,monospace" placeholder="acc1 user1@xx.com pass123 TOTPKEY
+acc2 user2@xx.com pass456
+
+每行/每组格式：账号名 邮箱 密码 [TOTP密钥]；省略账号名时自动生成 accN"></textarea>
+    <div class="hint" style="margin-top:6px">字段用空格/制表符隔开，TOTP 可省略；例：acc1 a@b.com 123456 | acc2 c@d.com 654321 SECRET；多个账号会排队逐个登录（内存限制，避免同时开多个浏览器），请耐心等待</div>
+    <div id="batchResult" class="tiny" style="margin-top:8px;white-space:pre-wrap;max-height:150px;overflow:auto"></div>
+    <div class="row"><button class="btn" onclick="hide('dlg')">取消</button><button class="btn btn-p" onclick="submitBatchAdd()">开始批量添加</button></div>`);
+}
+
+function parseBatchInput(text){
+  const out=[];
+  let autoN=document.querySelectorAll('#accountsTable tbody tr').length;
+  const groups=String(text||'').split(/[\n|;，,]/).map(s=>s.trim()).filter(Boolean);
+  for(const g of groups){
+    const f=g.split(/[\s\t]+/).filter(Boolean);
+    if(f.length<3)continue;
+    let name,email,password,totp='';
+    if(f.length>=4 || /^acc\d+$/i.test(f[0]) || !f[0].includes('@')){
+      name=f[0];email=f[1];password=f[2];totp=f[3]||'';
+    }else{
+      email=f[0];password=f[1];totp=f[2]||'';
+    }
+    out.push({name:name||('acc'+(++autoN)),email,password,totp});
+  }
+  return out;
+}
+
+async function submitBatchAdd(){
+  const accounts=parseBatchInput(q('#f_batch').value);
+  if(!accounts.length)return alert('未解析到任何账号，请检查格式（账号名 邮箱 密码 [TOTP]）');
+  const btn=q('#dlg .btn-p');const res=q('#batchResult');
+  btn.disabled=true;res.textContent='';
+  const lines=[];
+  for(let i=0;i<accounts.length;i++){
+    const a=accounts[i];
+    try{
+      await api('/api/admin/accounts',{method:'POST',body:a});
+      lines.push('✓ '+a.name+' '+a.email+' 已提交');
+    }catch(e){
+      lines.push('✗ '+a.name+' '+a.email+': '+e.message);
+    }
+    res.textContent=lines.join('\n');
+    await new Promise(r=>setTimeout(r,800));
+  }
+  btn.disabled=false;
+  lines.push('完成');
+  res.textContent=lines.join('\n');
+  refresh();
 }
 
 function openAddAccount(){

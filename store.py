@@ -241,11 +241,11 @@ class TaskStore:
         return [dict(r) for r in rows]
 
     def recoverable_queued_tasks(self) -> list:
-        """服务重启后恢复尚未拿到 conversation_id 的 queued 任务。"""
+        """服务重启后恢复尚未拿到 conversation_id 的任务（含排队中已标 processing 但没账号的孤儿任务）。"""
         with _LOCK:
             rows = self._conn.execute(
-                "SELECT * FROM tasks WHERE status='queued' "
-                "AND conversation_id IS NULL ORDER BY created_at"
+                "SELECT * FROM tasks WHERE status IN ('queued','processing') "
+                "AND conversation_id IS NULL AND account IS NULL ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
 

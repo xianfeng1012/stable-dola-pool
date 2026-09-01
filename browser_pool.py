@@ -297,7 +297,8 @@ class BrowserPool:
         } for a in self.list_accounts()]
 
     async def resume_video(self, account: str, conversation_id: str, timeout: int,
-                           on_poll=None) -> dict:
+                           on_poll=None, duration: int | None = None,
+                           ratio: str | None = None) -> dict:
         """恢复已受理会话；不参与选号，也不因账号当前额度状态跳过。"""
         async with self.semaphore:
             lock = self._locks.setdefault(account, asyncio.Lock())
@@ -306,7 +307,8 @@ class BrowserPool:
                     self._set_credit_balance(account, balance, source)
                 try:
                     result = await resume_video(account, conversation_id, timeout,
-                                                on_poll=on_poll, on_balance=on_balance)
+                                                on_poll=on_poll, on_balance=on_balance,
+                                                duration=duration, ratio=ratio)
                     self._claim(account)
                     self._conn.execute(
                         "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
