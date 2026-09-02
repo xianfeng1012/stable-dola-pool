@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -306,6 +306,58 @@ def _normalize_image_refs(*fields) -> list[str]:
     return [u for u in out if not (u in seen or seen.add(u))]
 
 
+def _deep_image_urls(value, out: list[str] | None = None, depth: int = 0) -> list[str]:
+    """递归抓取请求里任意层级的图片 URL（兼容画布工具的各种嵌套格式）。"""
+    if out is None:
+        out = []
+    if depth > 8 or len(out) >= 20 or value is None:
+        return out
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith(("http://", "https://", "data:image/")) and s not in out:
+            out.append(s)
+        return out
+    if isinstance(value, dict):
+        keys = [str(k).lower() for k in value]
+        has_image_ctx = (
+            any("image" in k or "ref" in k or "参考" in k for k in keys)
+            or "image" in str(value.get("type", "")).lower()
+        )
+        for k, v in value.items():
+            kk = str(k).lower()
+            if isinstance(v, str):
+                s = v.strip()
+                if ((has_image_ctx or kk in ("url", "uri", "image", "image_url", "file_url", "src"))
+                        and s.startswith(("http://", "https://", "data:image/")) and s not in out):
+                    out.append(s)
+            elif isinstance(v, (dict, list)):
+                _deep_image_urls(v, out, depth + 1)
+        return out
+    if isinstance(value, list):
+        for x in value:
+            _deep_image_urls(x, out, depth + 1)
+    return out
+
+
+def _log_image_fields(raw, endpoint: str) -> None:
+    """把疑似带图的请求原始结构打日志，便于定位画布工具实际传图字段。"""
+    if not isinstance(raw, dict):
+        return
+    try:
+        sample = json.dumps(raw, ensure_ascii=False)
+    except Exception:
+        return
+    markers = ('"image', "image_url", '"url"', '"content"', '"input', 'data:image', 'reference')
+    if not any(m in sample for m in markers):
+        return
+    keys = sorted(str(k) for k in raw.keys())
+    print(
+        f"[imgreq] {endpoint} top_keys={json.dumps(keys, ensure_ascii=False)} "
+        f"sample={sample[:700]}",
+        flush=True,
+    )
+
+
 def _map_ark_ratio(ratio) -> str | None:
     """Ark 的 ratio 直接透传；adaptive/未知值回落 dola 默认。"""
     if not ratio:
@@ -434,14 +486,24 @@ async def resume_incomplete_tasks():
 
 
 @app.post("/v1/videos/generations", response_model=TaskResponse)
-async def create_video(req: VideoGenRequest, authorization: str | None = Header(default=None)):
+async def create_video(request: Request, authorization: str | None = Header(default=None)):
     client = _auth(authorization)
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid json body")
+    _log_image_fields(raw, "openai")
+    try:
+        req = VideoGenRequest.model_validate(raw)
+    except Exception as exc:
+        raise HTTPException(422, str(exc)) from exc
     duration = req.duration or 10
     ratio = _resolve_ratio(req.size, req.ratio)
     refs = _normalize_image_refs(
         req.reference_images, req.image_url, req.image,
         req.input_image, req.input_images,
     )
+    refs = list(dict.fromkeys(refs + _deep_image_urls(raw)))
     if refs:
         print(f"[api] 收到参考图 {len(refs)} 张: {refs[0][:80]}", flush=True)
     return await _submit_task(client, req.model, req.prompt, ratio, duration, refs)
@@ -555,6 +617,7 @@ async def ark_create_task(body: dict, authorization: str | None = Header(default
     """POST .../contents/generations/tasks：Ark 风格创建，复用 dola 出片流程。"""
     client = _auth(authorization)
     body = body or {}
+    _log_image_fields(body, "ark")
     prompt_parts: list[str] = []
     reference_images: list[str] = []
     for item in body.get("content") or []:
@@ -575,6 +638,7 @@ async def ark_create_task(body: dict, authorization: str | None = Header(default
         reference_images, body.get("image_url"), body.get("image"),
         body.get("input_image"), body.get("input_images"),
     )
+    reference_images = list(dict.fromkeys(reference_images + _deep_image_urls(body)))
     prompt = "\n".join(prompt_parts).strip()
     if not prompt:
         raise HTTPException(422, "content 中缺少 text 提示词")

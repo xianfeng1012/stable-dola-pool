@@ -44,11 +44,13 @@ def _decode_data_image(url: str) -> tuple[bytes, str]:
 
 def validate_public_url(url: str) -> str:
     """只接受公网 HTTP(S) URL，拒绝 localhost/内网/带认证信息的 URL。"""
-    if not isinstance(url, str) or len(url) > 4096:
+    if not isinstance(url, str):
         raise ValueError("参考图片 URL 无效")
     if _is_data_image(url):
         _decode_data_image(url)
         return url
+    if len(url) > 4096:
+        raise ValueError("参考图片 URL 无效")
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("参考图片只支持 http/https 公网 URL")
@@ -79,11 +81,13 @@ def awaitable_getaddrinfo(host: str) -> list[str]:
 
 
 async def _validate_url_async(url: str) -> str:
-    if not isinstance(url, str) or len(url) > 4096:
+    if not isinstance(url, str):
         raise ValueError("参考图片 URL 无效")
     if _is_data_image(url):
         _decode_data_image(url)
         return url
+    if len(url) > 4096:
+        raise ValueError("参考图片 URL 无效")
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("参考图片只支持 http/https 公网 URL")
