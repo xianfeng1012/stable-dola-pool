@@ -97,6 +97,7 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
   <button class="on" data-tab="dash" onclick="switchTab('dash')">仪表盘</button>
   <button data-tab="accounts" onclick="switchTab('accounts')">账号管理</button>
   <button data-tab="tasks" onclick="switchTab('tasks')">任务列表</button>
+  <button data-tab="videos" onclick="switchTab('videos')">视频管理</button>
   <button data-tab="keys" onclick="switchTab('keys')">API 密钥</button>
 </nav>
 
@@ -123,6 +124,16 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
 
   <section id="tab-tasks" style="display:none">
     <div class="card"><h3>任务列表（最近 50 条）</h3><div id="tasksTable"></div></div>
+  </section>
+
+  <section id="tab-videos" style="display:none">
+    <div class="card">
+      <div class="toolbar">
+        <h3 style="margin:0">视频管理（已生成的视频）</h3>
+        <button class="btn" onclick="loadVideos()">刷新</button>
+      </div>
+      <div id="videosTable"></div>
+    </div>
   </section>
 
   <section id="tab-keys" style="display:none">
@@ -180,7 +191,7 @@ function logout(){adminKey='';localStorage.removeItem(LS_KEY);showLogin();}
 function switchTab(t){
   curTab=t;
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
-  ['dash','accounts','tasks','keys'].forEach(x=>{q('#tab-'+x).style.display=x===t?'block':'none';});
+  ['dash','accounts','tasks','videos','keys'].forEach(x=>{q('#tab-'+x).style.display=x===t?'block':'none';});
   refresh();
 }
 
@@ -191,6 +202,7 @@ async function refresh(){
     if(curTab==='dash')await loadDash();
     else if(curTab==='accounts')await loadAccounts();
     else if(curTab==='tasks')await loadTasks();
+    else if(curTab==='videos')await loadVideos();
     else if(curTab==='keys')await loadKeys();
   }catch(e){if(e.message!=='unauthorized'){/* 静默 */}}
 }
@@ -248,9 +260,11 @@ async function setSched(name,on){
 
 /* ---- 账号管理 ---- */
 let selAccounts=new Set();
+let allAccountNames=[];
 async function loadAccounts(){
   const [a,j]=await Promise.all([api('/api/admin/accounts'),api('/api/admin/jobs')]);
   const jobs=j.jobs||{};
+  allAccountNames=a.accounts.map(x=>x.name);
   const rows=a.accounts.map(x=>{
     const jb=jobs[x.name];
     const badge=(jb&&jb.kind==='add'&&jb.status==='running')?'<span class="badge b-blue">加号中</span>'
@@ -269,7 +283,22 @@ async function loadAccounts(){
       `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">验证</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">删除</button>`
     ];
   });
-  q('#accountsTable').innerHTML=table(['选择','内部账号','名称','状态','调度','今日剩余','最近使用','创建时间','操作'],rows);
+  q('#accountsTable').innerHTML=table(
+    ['<input type="checkbox" id="selAll" onchange="toggleAll(this.checked)" title="全选/取消全选">',
+     '内部账号','名称','状态','调度','今日剩余','最近使用','创建时间','操作'],rows);
+  const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
+  b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
+  const selAll=q('#selAll');
+  if(selAll){
+    selAll.checked=selAccounts.size>0&&selAccounts.size===allAccountNames.length;
+    selAll.indeterminate=selAccounts.size>0&&selAccounts.size<allAccountNames.length;
+  }
+}
+
+function toggleAll(on){
+  selAccounts.clear();
+  if(on)allAccountNames.forEach(n=>selAccounts.add(n));
+  loadAccounts();
   const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
   b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
 }
@@ -291,6 +320,11 @@ function toggleSel(name,on){
   if(on)selAccounts.add(name);else selAccounts.delete(name);
   const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
   b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
+  const selAll=q('#selAll');
+  if(selAll){
+    selAll.checked=selAccounts.size>0&&selAccounts.size===allAccountNames.length;
+    selAll.indeterminate=selAccounts.size>0&&selAccounts.size<allAccountNames.length;
+  }
 }
 
 async function delSelected(){
@@ -309,30 +343,73 @@ async function delSelected(){
 
 function openBatchAdd(){
   showDlg(`<h2>批量添加账号</h2>
-    <label>账号列表（每行一个，也可用 | 或 ; 分隔多个）</label>
+    <label>账号列表（支持多种格式，见下方提示）</label>
     <textarea id="f_batch" rows="10" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:ui-monospace,Consolas,monospace" placeholder="acc1 user1@xx.com pass123 TOTPKEY
 acc2 user2@xx.com pass456
 
-每行/每组格式：账号名 邮箱 密码 [TOTP密钥]；省略账号名时自动生成 accN"></textarea>
-    <div class="hint" style="margin-top:6px">字段用空格/制表符隔开，TOTP 可省略；例：acc1 a@b.com 123456 | acc2 c@d.com 654321 SECRET；多个账号会排队逐个登录（内存限制，避免同时开多个浏览器），请耐心等待</div>
+支持格式：
+1) 每行一个：账号名 邮箱 密码 [TOTP]
+2) 一行内用 | 分隔账号：acc1 a@b.com 123 | acc2 c@d.com 456
+3) 字段用 | 分隔：acc1|a@b.com|123|TOTPKEY
+4) 邮箱|密码 / 邮箱---密码（自动命名 accN，可选 TOTP）
+账号名可省略（自动 accN），TOTP 可省略"></textarea>
+    <div class="hint" style="margin-top:6px">字段分隔支持 空格 / | / ---；多个账号会排队逐个登录（内存限制，避免同时开多个浏览器），请耐心等待</div>
     <div id="batchResult" class="tiny" style="margin-top:8px;white-space:pre-wrap;max-height:150px;overflow:auto"></div>
     <div class="row"><button class="btn" onclick="hide('dlg')">取消</button><button class="btn btn-p" onclick="submitBatchAdd()">开始批量添加</button></div>`);
+}
+
+function buildRecord(f){
+  if(!f || f.length<2)return null;
+  // 只有 邮箱 密码 两字段（无账号名、无 TOTP）→ 自动命名 accN
+  if(f.length===2 && f[0].includes('@')){
+    return {name:null,email:f[0],password:f[1],totp:''};
+  }
+  if(f.length<3)return null;
+  let name,email,password,totp='';
+  if(f.length>=4 || /^acc\d+$/i.test(f[0]) || !f[0].includes('@')){
+    name=f[0];email=f[1];password=f[2];totp=f[3]||'';
+  }else{
+    email=f[0];password=f[1];totp=f[2]||'';
+  }
+  return {name:name||null,email,password,totp};
 }
 
 function parseBatchInput(text){
   const out=[];
   let autoN=document.querySelectorAll('#accountsTable tbody tr').length;
-  const groups=String(text||'').split(/[\n|;，,]/).map(s=>s.trim()).filter(Boolean);
-  for(const g of groups){
-    const f=g.split(/[\s\t]+/).filter(Boolean);
-    if(f.length<3)continue;
-    let name,email,password,totp='';
-    if(f.length>=4 || /^acc\d+$/i.test(f[0]) || !f[0].includes('@')){
-      name=f[0];email=f[1];password=f[2];totp=f[3]||'';
-    }else{
-      email=f[0];password=f[1];totp=f[2]||'';
+  // 统一全角分隔符
+  text=String(text||'').replace(/[，；｜]/g,c=>({'，':',','；':';','｜':'|'}[c]));
+  // 先按换行/分号/逗号切成块
+  const blocks=text.split(/[\n;,]/).map(s=>s.trim()).filter(Boolean);
+  const pushRec=(f)=>{
+    const rec=buildRecord(f);
+    if(rec){ if(!rec.name) rec.name='acc'+(++autoN); out.push(rec); }
+  };
+  for(const block of blocks){
+    // 1) 字段用 --- 分隔：邮箱---密码 / 账号名---邮箱---密码---TOTP
+    if(block.includes('---')){
+      pushRec(block.split(/---+/).map(s=>s.trim()).filter(Boolean));
+      continue;
     }
-    out.push({name:name||('acc'+(++autoN)),email,password,totp});
+    // 2) 字段用 | 分隔或一行内多个账号用 | 分隔
+    const parts=block.split('|').map(s=>s.trim()).filter(Boolean);
+    if(parts.length===1){
+      // 纯空格格式：账号名 邮箱 密码 [TOTP]
+      pushRec(parts[0].split(/\s+/).filter(Boolean));
+    }else if(parts.length===2){
+      // 邮箱|密码（两侧都无空格）→ 单账号；否则视为「账号1 | 账号2」两个账号
+      if(!parts[0].includes(' ') && !parts[1].includes(' ')){
+        pushRec(parts);
+      }else{
+        for(const part of parts) pushRec(part.split(/\s+/).filter(Boolean));
+      }
+    }else if(parts.length>=3 && parts.length<=4){
+      // | 分隔字段的单个账号：账号名|邮箱|密码[|TOTP]
+      pushRec(parts);
+    }else{
+      // 一行内多个账号用 | 分隔，每段是「账号名 邮箱 密码 [TOTP]」
+      for(const part of parts) pushRec(part.split(/\s+/).filter(Boolean));
+    }
   }
   return out;
 }
@@ -398,6 +475,46 @@ async function loadTasks(){
 function playVideo(url){q('#videoEl').src=url;show('videoModal');}
 function closeVideo(){q('#videoEl').pause();q('#videoEl').src='';hide('videoModal');}
 
+/* ---- 视频管理 ---- */
+function fmtSize(b){
+  if(!b||b<=0)return '-';
+  if(b>=1<<30)return (b/(1<<30)).toFixed(2)+' GB';
+  if(b>=1<<20)return (b/(1<<20)).toFixed(1)+' MB';
+  return Math.round(b/1024)+' KB';
+}
+function fmtDur(s){
+  if(!s||s<=0)return '-';
+  if(s<60)return Math.round(s)+' 秒';
+  const m=Math.floor(s/60);const sec=Math.round(s%60);
+  return m+' 分 '+sec+' 秒';
+}
+async function loadVideos(){
+  const r=await api('/api/admin/videos');
+  const rows=(r.videos||[]).map(v=>{
+    const size=fmtSize(v.video_size||v.file_size);
+    const dur=fmtDur(v.video_duration||v.duration);
+    const dim=(v.video_width&&v.video_height)?v.video_width+'×'+v.video_height
+      :(v.ratio&&v.ratio!=='default'?v.ratio:'-');
+    return [
+      fmt(v.created_at),
+      dur,
+      dim,
+      size,
+      v.account||'-',
+      v.model||'-',
+      '<span class="prompt" title="'+esc(v.prompt||'')+'">'+esc(v.prompt||'')+'</span>',
+      v.video_url
+        ?'<div class="video-wrap"><button class="btn" style="margin-right:6px" onclick="playVideo(&quot;'+esc(v.video_url)+'&quot;)">预览</button><button class="btn" onclick="copyLink(&quot;'+esc(v.video_url)+'&quot;)">复制链接</button></div>'
+        :'—'
+    ];
+  });
+  q('#videosTable').innerHTML=table(['生成时间','时长','尺寸','大小','账号','模型','提示词','操作'],rows);
+}
+async function copyLink(url){
+  await copy(url);
+  alert('链接已复制');
+}
+
 /* ---- API 密钥 ---- */
 async function loadKeys(){
   const r=await api('/api/admin/keys');
@@ -410,13 +527,17 @@ async function loadKeys(){
     (k.concurrency_limit?`${k.today_active} / ${k.concurrency_limit}`:`${k.today_active} / 不限`)+(k.today_queued?` <span class=\"tiny\">排队 ${k.today_queued}</span>`:''),
     `<label class="sw"><input type="checkbox" ${k.enabled?'checked':''} onchange="setKey('${k.key}',this.checked)"><i></i></label>`,
     fmt(k.last_used_at),
-    `<button class="btn" style="margin-right:6px" onclick="openEditKey('${k.key}')">设置</button><button class="btn btn-danger" onclick="delKey('${k.key}')">删除</button>`
+    `<button class="btn" style="margin-right:6px" onclick="copyKey('${k.key}')">复制</button><button class="btn" style="margin-right:6px" onclick="openEditKey('${k.key}')">设置</button><button class="btn btn-danger" onclick="delKey('${k.key}')">删除</button>`
   ]);
   q('#keysTable').innerHTML=table(['Key','名称','允许时长','今日任务','并发','启用','最近使用','操作'],rows)
     +(r.env_keys>0?`<div class="hint" style="margin-top:10px">另有 ${r.env_keys} 个环境变量 key（永久有效，面板只读）</div>`:'');
 }
 async function setKey(key,on){
   try{await api('/api/admin/keys/'+encodeURIComponent(key),{method:'PATCH',body:{enabled:on}});}catch(e){alert(e.message);}refresh();
+}
+async function copyKey(key){
+  await copy(key);
+  alert('已复制 '+(key.slice(0,8)+'…'+key.slice(-4)));
 }
 async function delKey(key){
   if(!confirm('删除该密钥？调用方将立即失效。'))return;

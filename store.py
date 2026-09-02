@@ -69,6 +69,12 @@ class TaskStore:
                 ("started_at", "REAL"),
                 ("finished_at", "REAL"),
                 ("client_concurrency_limit", "INTEGER DEFAULT 0"),
+                ("video_size", "INTEGER"),
+                ("video_width", "INTEGER"),
+                ("video_height", "INTEGER"),
+                ("video_duration", "REAL"),
+                ("video_bitrate", "INTEGER"),
+                ("attempt", "INTEGER DEFAULT 0"),
             ):
                 try:
                     self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")

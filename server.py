@@ -11,8 +11,10 @@ import asyncio
 import aiohttp
 import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
 import time
 import uuid
 from collections import defaultdict
@@ -48,8 +50,71 @@ SIZE_TO_RATIO = {
     "720x1280": "9:16", "1080x1920": "9:16",
     "1024x1024": "1:1", "1440x1080": "4:3", "1080x1440": "3:4",
 }
+VIDEO_MAX_ATTEMPTS = 3  # 生成失败自动换号重试上限（超时不重试）
 SUPPORTED_DURATIONS = (10, 15, 30)
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+RATIO_TO_DIMENSIONS = {
+    "16:9": (1280, 720), "9:16": (720, 1280),
+    "1:1": (1024, 1024), "4:3": (1440, 1080), "3:4": (1080, 1440),
+}
+
+
+def _probe_with_ffprobe(path: str) -> dict | None:
+    """用 ffprobe 读取真实视频元数据；未安装或解析失败返回 None。"""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        return None
+    stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+    fmt = data.get("format") or {}
+    meta = {}
+    if stream:
+        try:
+            meta["video_width"] = int(stream.get("width") or 0) or None
+            meta["video_height"] = int(stream.get("height") or 0) or None
+        except (TypeError, ValueError):
+            pass
+        dur = stream.get("duration") or fmt.get("duration")
+        try:
+            meta["video_duration"] = float(dur) if dur else None
+        except (TypeError, ValueError):
+            pass
+    bit_rate = fmt.get("bit_rate")
+    try:
+        meta["video_bitrate"] = int(bit_rate) if bit_rate else None
+    except (TypeError, ValueError):
+        pass
+    return {k: v for k, v in meta.items() if v is not None} or None
+
+
+def _video_metadata(local_path: str, duration: int | None, ratio: str | None) -> dict:
+    """出片完成后的视频元数据：优先 ffprobe 真实值，缺失时用任务记录推算。"""
+    meta: dict = {}
+    try:
+        meta["video_size"] = os.path.getsize(local_path)
+    except OSError:
+        pass
+    probed = _probe_with_ffprobe(local_path)
+    if probed:
+        meta.update(probed)
+    else:
+        w, h = RATIO_TO_DIMENSIONS.get(ratio or "", (0, 0))
+        if w and h:
+            meta["video_width"], meta["video_height"] = w, h
+        if duration:
+            meta["video_duration"] = float(duration)
+    if meta.get("video_size") and meta.get("video_duration"):
+        meta["video_bitrate"] = int(meta["video_size"] * 8 / meta["video_duration"])
+    return meta
 
 
 class KeyConcurrencyLimiter:
@@ -228,16 +293,22 @@ async def _run_task(task_id, model, prompt, ratio, duration, reference_images, c
         def on_poll(now):
             store.update(task_id, last_poll_at=now)
 
+        def on_account_try(account, attempt):
+            store.update(task_id, status="processing", account=account,
+                         attempt=attempt, last_poll_at=time.time())
+
         reference_root, reference_paths = await download_reference_images(
             reference_images or [], task_id)
         result = await pool.generate_video(
             prompt, ratio, duration, model,
             on_conversation_id=on_conversation_id, on_poll=on_poll,
-            reference_image_paths=reference_paths)
+            reference_image_paths=reference_paths,
+            on_account_try=on_account_try, max_attempts=VIDEO_MAX_ATTEMPTS)
         public_url = f"{config.PUBLIC_BASE}/videos/{Path(result['local_path']).name}"
+        meta = _video_metadata(result["local_path"], duration, ratio)
         store.update(task_id, status="completed", video_url=public_url,
                      account=result.get("account"), last_poll_at=time.time(),
-                     finished_at=time.time())
+                     finished_at=time.time(), **meta)
     except (AllAccountsLimitedError, AllAccountsQuotaBlockedError) as e:
         store.update(task_id, status="failed", error=str(e)[:500],
                      failure_code="429", finished_at=time.time())
@@ -275,9 +346,10 @@ async def _resume_task(row: dict):
             duration=row.get("duration"),
             ratio=None if row.get("ratio") == "default" else row.get("ratio"))
         public_url = f"{config.PUBLIC_BASE}/videos/{Path(result['local_path']).name}"
+        meta = _video_metadata(result["local_path"], row.get("duration"), row.get("ratio"))
         store.update(task_id, status="completed", video_url=public_url,
                      account=result.get("account"), last_poll_at=time.time(),
-                     finished_at=time.time())
+                     finished_at=time.time(), **meta)
     except Exception as e:
         store.update(task_id, status="failed", error=str(e)[:500],
                      finished_at=time.time())
@@ -631,6 +703,32 @@ async def admin_jobs(x_admin_key: str | None = Header(default=None)):
 async def admin_tasks(limit: int = 50, x_admin_key: str | None = Header(default=None)):
     _admin_auth(x_admin_key)
     return {"tasks": store.recent_tasks(min(max(limit, 1), 200))}
+
+
+@app.get("/api/admin/videos")
+async def admin_videos(limit: int = 100, x_admin_key: str | None = Header(default=None)):
+    """视频管理：已完成任务的列表 + 文件元数据（老任务按需从磁盘补大小）。"""
+    _admin_auth(x_admin_key)
+    rows = store.recent_tasks(min(max(limit, 1), 500))
+    out = []
+    for r in rows:
+        if r.get("status") != "completed" or not r.get("video_url"):
+            continue
+        item = dict(r)
+        local = Path(config.DOWNLOAD_DIR) / Path(item["video_url"]).name
+        if local.exists():
+            item["file_exists"] = True
+            try:
+                item["file_size"] = os.path.getsize(local)
+            except OSError:
+                item["file_size"] = item.get("video_size")
+            if not item.get("video_size"):
+                item["video_size"] = item["file_size"]
+        else:
+            item["file_exists"] = False
+        out.append(item)
+    out.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
+    return {"videos": out}
 
 
 @app.get("/api/admin/stats")

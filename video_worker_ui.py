@@ -46,6 +46,19 @@ TERMINAL_TEXT_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
+# Dola 通用失败文案（2026-09-01 实测：提交后对话返回「エラーが発生しました。もう一度お試しください。」
+# 但页面一直卡"生成中"——这类通用报错不属于每日上限/额度不足/终结性提问，必须单独识别）。
+# 连续 HARD_ERROR_TEXT_MAX_HITS 次命中且无视频 → 判失败（比终结文字 12 次更快）。
+HARD_ERROR_TEXT_PATTERNS = [
+    re.compile(
+        r"エラーが発生しました|エラーが発生し|エラーが発生|もう一度お試しください|"
+        r"サーバーエラー|内部エラー|通信エラー|システムエラー|予期しないエラー|"
+        r"an error occurred|something went wrong|unexpected error|request failed|"
+        r"please try again|try again later",
+        re.IGNORECASE,
+    ),
+]
+HARD_ERROR_TEXT_MAX_HITS = 3
 # 正常受理文案：出现则说明 Dola 已开始生成，重置终结计数（避免把提问/占位文字误判为失败）
 ACCEPTANCE_TEXT_PATTERN = re.compile(
     r"生成されます|5 分後に完成|ポイントを消費|を生成します|ビデオを生成|動画を生成|生成を開始",
@@ -59,7 +72,8 @@ TERMINAL_TEXT_MAX_HITS = 12
 DURATION_CHOICE_RE = re.compile(r"([A-Da-d])\s*[.．、)）\]]?\s*(\d+)\s*秒", re.IGNORECASE)
 DURATION_CHOICE_QUESTION_RE = re.compile(
     r"動画生成には|秒で生成|A/B/C で選んで|supports durations from|nearest supported duration|"
-    r"秒数は|から選んで|選んでください|選んで下さい|choose.*duration|select.*duration",
+    r"秒数は|から選んで|選んでください|選んで下さい|choose.*duration|select.*duration|"
+    r"対応しています|別の秒数|秒数をご希望|秒数を指定",
     re.IGNORECASE,
 )
 
@@ -78,6 +92,10 @@ def _build_duration_reply(text: str, duration: int | None, ratio: str | None) ->
             if int(m.group(2)) == duration:
                 return f"{m.group(1).upper()}. {duration}秒"
         return None  # 有字母选项但没有匹配时长 → 无法满足，交给终结检测快速失败
+    # 新格式（2026-09-01）：「動画生成は現在4～15秒に対応しています。…別の秒数をご希望でしたら指定してください。」
+    # 没有字母选项也没有「例：16:9、10秒」，直接回「N秒」即可。
+    if re.search(r"対応しています|別の秒数|秒数をご希望|秒数を指定", text, re.IGNORECASE):
+        return f"{duration}秒"
     return f"{ratio or '16:9'}、{duration}秒"
 
 
@@ -363,12 +381,19 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
     cookies = await context.cookies("https://www.dola.com")
     ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
     start = time.time()
+    deadline = start + timeout  # 出片超时上限（默认 30 分钟，dola.env DOLA_VIDEO_TIMEOUT）
     last_callback = 0.0
     terminal_hits = 0
+    hard_error_hits = 0
     last_terminal_text = ""
+    last_hard_error_text = ""
     choice_replied = False
     while True:
         await asyncio.sleep(5)
+        if time.time() > deadline:
+            raise TimeoutError(
+                f"出片超时：{int(timeout)}s 内未出片（conversation_id={conversation_id}）"
+            )
         try:
             poll = await asyncio.wait_for(page.evaluate(
                 POLL_JS, {"conversationId": conversation_id, "msToken": ms_token, "fp": fp}), timeout=30)
@@ -400,6 +425,7 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
                             print(f"[{account}] 回复时长选择失败: {str(e)[:100]}", flush=True)
         terminal_now = False
         acceptance_now = False
+        hard_error_now = False
         for text in texts:
             balance, _, source = _parse_balance_texts([text])
             if balance is not None and on_balance:
@@ -413,8 +439,16 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
             if not terminal_now and any(p.search(text) for p in TERMINAL_TEXT_PATTERNS):
                 terminal_now = True
                 last_terminal_text = text
+            if not hard_error_now and any(p.search(text) for p in HARD_ERROR_TEXT_PATTERNS):
+                hard_error_now = True
+                last_hard_error_text = text
+        # 已回复时长选择后，同一段时长提问文字会一直在对话里，不能把它继续当失败信号；
+        # 真失败会走硬错误识别或 30 分钟出片超时。
         if not videos and terminal_now and not acceptance_now:
-            terminal_hits += 1
+            if not (choice_replied and DURATION_CHOICE_QUESTION_RE.search(last_terminal_text)):
+                terminal_hits += 1
+            else:
+                terminal_hits = 0
         else:
             terminal_hits = 0
         if terminal_hits >= TERMINAL_TEXT_MAX_HITS:
@@ -422,8 +456,22 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
                 f"Dola 未真正出片（连续收到终结性文字回复且无视频，疑似提交失败）: "
                 f"{last_terminal_text[:150]}"
             )
+        if not videos and hard_error_now and not acceptance_now:
+            hard_error_hits += 1
+        else:
+            hard_error_hits = 0
+        if hard_error_hits >= HARD_ERROR_TEXT_MAX_HITS:
+            raise RuntimeError(
+                f"Dola 返回错误（连续 {HARD_ERROR_TEXT_MAX_HITS} 次且无视频）: "
+                f"{last_hard_error_text[:150]}"
+            )
         if videos:
             video_models = poll.get("videoModels", [])
+            if video_models:
+                print(
+                    f"[{account}] videoModels={str(video_models[0])[:2000]}",
+                    flush=True,
+                )
             url = extract_unwatermarked_url(
                 video_models[0] if video_models else "", videos[0])
             print(f"[{account}] 出片! 下载中（无水印优先）...", flush=True)
@@ -501,7 +549,8 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
             await page.wait_for_timeout(1500)
             if reference_image_paths:
                 await attach_reference_images(page, reference_image_paths)
-            # 选择模型。扩展/当前网页端文案：モデル 2.0高速、モデル 2.5。
+            # 选择模型（尽力而为）：扩展/当前网页端文案 モデル 2.0高速/2.5；
+            # 部分账号 UI 变体没有该按钮，找不到就沿用 Dola 默认模型，不阻塞出片。
             try:
                 current_model = None
                 for label in ("モデル 2.0高速", "モデル 2.5"):
@@ -511,7 +560,11 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
                         break
                 if current_model is None:
                     current_model = page.get_by_text(re.compile(r"^モデル "), exact=False).first
-                await current_model.click(timeout=5000)
+                try:
+                    await current_model.click(timeout=5000)
+                except Exception:
+                    # radix popper 子元素拦截点击时，用 JS 直接派发点击
+                    await current_model.evaluate("(el) => el.click()")
                 await page.wait_for_timeout(500)
                 options = (("Dreamina Seedance 2.5",)
                            if model_key == "seedance_v2.5"
@@ -529,10 +582,10 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
                         selected = True
                         break
                 if not selected:
-                    raise RuntimeError("模型选项不存在")
+                    print(f"  (未找到模型选项，用 Dola 默认: {model_key})", flush=True)
                 await page.wait_for_timeout(500)
             except Exception as e:
-                raise RuntimeError(f"设置模型失败（{model_key}）: {str(e)[:120]}") from e
+                print(f"  (设置模型失败，用 Dola 默认: {str(e)[:100]})", flush=True)
             if ratio:
                 try:
                     await page.click("text=比率", timeout=3000)

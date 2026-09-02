@@ -323,71 +323,89 @@ class BrowserPool:
     async def generate_video(self, prompt: str, ratio: str = None, duration: int = None,
                              model: str = "seedance_v2.0", on_conversation_id=None,
                              on_poll=None, on_balance=None,
-                             reference_image_paths: list[str] | None = None) -> dict:
-        """挑一个可调度且空闲的号出片；额度不足/风控自动换号（风控号进冷却）。"""
+                             reference_image_paths: list[str] | None = None,
+                             on_account_try=None, max_attempts: int = 3) -> dict:
+        """挑一个可调度且空闲的号出片；失败自动换号重试（最多 max_attempts 次）。
+
+        - 额度不足/每日上限/风控/积分不足/通用失败（未真正出片、Dola 报错等）
+          → 换下一个号以同样参数继续（风控号进冷却、上限号封顶）。
+        - TimeoutError（已拿到 conversation_id 后轮询超时）→ 不换号直接失败：
+          Dola 端可能仍在生成，换号重提会重复扣额度/重复出片。
+        """
         async with self.semaphore:
             last_err = None
-            for a in self.list_accounts():
-                if not self._schedulable(a):
-                    continue
-                account = a["name"]
-                lock = self._locks.setdefault(account, asyncio.Lock())
-                # 并发任务跳过已占用账号，避免多个请求排队到同一个 profile。
-                if lock.locked():
-                    continue
-                async with lock:
-                    if not self._schedulable(next(x for x in self.list_accounts() if x['name'] == account)):
-                        continue  # 等待期间状态变化
-                    try:
-                        def on_balance(balance, source=""):
-                            self._set_credit_balance(account, balance, source)
+            attempt = 0
+            tried: set[str] = set()
+            while attempt < max_attempts:
+                picked = False
+                for a in self.list_accounts():
+                    if not self._schedulable(a) or a["name"] in tried:
+                        continue
+                    account = a["name"]
+                    lock = self._locks.setdefault(account, asyncio.Lock())
+                    # 并发任务跳过已占用账号，避免多个请求排队到同一个 profile。
+                    if lock.locked():
+                        continue
+                    async with lock:
+                        if not self._schedulable(next(x for x in self.list_accounts() if x['name'] == account)):
+                            continue  # 等待期间状态变化
+                        picked = True
+                        attempt += 1
+                        if on_account_try:
+                            on_account_try(account, attempt)
+                        try:
+                            def on_balance(balance, source=""):
+                                self._set_credit_balance(account, balance, source)
 
-                        result = await generate_video(
-                            account, prompt, ratio, duration, model=model,
-                            on_conversation_id=on_conversation_id, on_poll=on_poll,
-                            on_balance=on_balance, reference_image_paths=reference_image_paths)
-                        self._claim(account)
-                        self._conn.execute(
-                            "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
-                            (time.time(), account))
-                        self._conn.commit()
-                        return result
-                    except CreditInsufficientError as e:
-                        print(f"[pool] {account} 生成前积分不足，跳过: {e}", flush=True)
-                        self._mark_quota_blocked(account, str(e))
-                        last_err = e
-                        continue
-                    except AccountLimitedError as e:
-                        print(f"[pool] {account} 达到每日上限，立即换号: {e}", flush=True)
-                        self._mark_daily_limit(account, str(e))
-                        last_err = e
-                        continue
-                    except CreditError as e:
-                        print(f"[pool] {account} 额度不足，换号: {e}", flush=True)
-                        self._claim(account)
-                        last_err = e
-                        continue
-                    except RiskControlError as e:
-                        print(f"[pool] {account} 风控，冷却 30 分钟，换号: {e}", flush=True)
-                        self._conn.execute(
-                            "UPDATE accounts_meta SET cooldown_until=? WHERE name=?",
-                            (time.time() + COOLDOWN_SEC, account))
-                        self._conn.commit()
-                        last_err = e
-                        continue
-                    except TimeoutError as e:
-                        # 请求已拿到 conversation_id 后仍可能在 Dola 端继续生成。
-                        # 绝不能因为本地轮询超时就换号重提，否则会重复扣额度/重复出片。
-                        self._claim(account)
-                        self._conn.execute(
-                            "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
-                            (time.time(), account))
-                        self._conn.commit()
-                        raise
-                    except FileNotFoundError as e:
-                        print(f"[pool] {account} profile 缺失，跳过: {e}", flush=True)
-                        last_err = e
-                        continue
+                            result = await generate_video(
+                                account, prompt, ratio, duration, model=model,
+                                on_conversation_id=on_conversation_id, on_poll=on_poll,
+                                on_balance=on_balance, reference_image_paths=reference_image_paths)
+                            self._claim(account)
+                            self._conn.execute(
+                                "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
+                                (time.time(), account))
+                            self._conn.commit()
+                            return result
+                        except CreditInsufficientError as e:
+                            print(f"[pool] {account} 生成前积分不足，跳过: {e}", flush=True)
+                            self._mark_quota_blocked(account, str(e))
+                            last_err = e
+                        except AccountLimitedError as e:
+                            print(f"[pool] {account} 达到每日上限，立即换号: {e}", flush=True)
+                            self._mark_daily_limit(account, str(e))
+                            last_err = e
+                        except CreditError as e:
+                            print(f"[pool] {account} 额度不足，换号: {e}", flush=True)
+                            self._claim(account)
+                            last_err = e
+                        except RiskControlError as e:
+                            print(f"[pool] {account} 风控，冷却 30 分钟，换号: {e}", flush=True)
+                            self._conn.execute(
+                                "UPDATE accounts_meta SET cooldown_until=? WHERE name=?",
+                                (time.time() + COOLDOWN_SEC, account))
+                            self._conn.commit()
+                            last_err = e
+                        except TimeoutError as e:
+                            # 请求已拿到 conversation_id 后仍可能在 Dola 端继续生成。
+                            # 绝不能因为本地轮询超时就换号重提，否则会重复扣额度/重复出片。
+                            self._claim(account)
+                            self._conn.execute(
+                                "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
+                                (time.time(), account))
+                            self._conn.commit()
+                            raise
+                        except FileNotFoundError as e:
+                            print(f"[pool] {account} profile 缺失，跳过: {e}", flush=True)
+                            last_err = e
+                        except Exception as e:
+                            print(f"[pool] {account} 生成失败（第 {attempt} 次），换号重试: {e}", flush=True)
+                            last_err = e
+                        tried.add(account)
+                        if attempt >= max_attempts:
+                            break
+                if not picked:
+                    break
             if self.all_accounts_quota_blocked:
                 raise AllAccountsQuotaBlockedError(
                     f"429: 所有已开启调度的账号均已知积分不足: {last_err or '无号'}"
@@ -395,5 +413,9 @@ class BrowserPool:
             if self.all_accounts_limited:
                 raise AllAccountsLimitedError(
                     f"429: 所有已开启调度的账号均已达到 Dola 每日视频上限: {last_err or '无号'}"
+                )
+            if last_err is not None:
+                raise RuntimeError(
+                    f"连续 {attempt} 次生成均失败（已自动换号重试）: {str(last_err)[:300]}"
                 )
             raise RuntimeError(f"号池无可用账号（调度关闭/冷却/额度用完）: {last_err or '无号'}")
