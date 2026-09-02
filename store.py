@@ -222,6 +222,13 @@ class TaskStore:
             row = self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return dict(row) if row else None
 
+    def delete_task(self, task_id: str) -> bool:
+        """彻底删除一条任务记录（删除视频时连记录一并清理）。"""
+        with _LOCK:
+            cur = self._conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
     def get_for_client(self, task_id, api_key_hash: str | None):
         """只返回属于当前 API Key 的任务；匿名开发模式按 NULL hash 隔离。"""
         with _LOCK:

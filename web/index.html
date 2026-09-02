@@ -424,8 +424,43 @@ async function submitBatchAdd(){
   const btn=q('#dlg .btn-p');const res=q('#batchResult');
   btn.disabled=true;res.textContent='';
   const lines=[];
-  for(let i=0;i<accounts.length;i++){
-    const a=accounts[i];
+  const normEmail=e=>String(e||'').trim().toLowerCase();
+  // 先拉取现有账号与进行中的加号任务，按邮箱剔除重复项
+  let existing=[],jobs={};
+  try{
+    const [a,j]=await Promise.all([api('/api/admin/accounts'),api('/api/admin/jobs')]);
+    existing=a.accounts||[];jobs=j.jobs||{};
+  }catch(e){}
+  const owner=new Map();
+  existing.forEach(x=>{if(x.email&&!owner.has(normEmail(x.email)))owner.set(normEmail(x.email),x.name);});
+  Object.entries(jobs).forEach(([name,job])=>{
+    if(job.kind==='add'&&job.status==='running'&&job.email&&!owner.has(normEmail(job.email)))
+      owner.set(normEmail(job.email),name+'（添加中）');
+  });
+  const nameTaken=new Set(existing.map(x=>x.name));
+  const seen=new Map();
+  const todo=[];const dups=[];
+  accounts.forEach((a,idx)=>{
+    const em=normEmail(a.email);
+    let why='';
+    if(nameTaken.has(a.name))why='账号名 '+a.name+' 已存在';
+    else if(owner.has(em))why='邮箱重复（已存在 '+owner.get(em)+'）';
+    else if(seen.has(em))why='本批内重复（第 '+(seen.get(em)+1)+' 条）';
+    if(why){
+      dups.push('跳过 '+a.name+' '+a.email+'：'+why);
+      return;
+    }
+    seen.set(em,idx);
+    nameTaken.add(a.name);
+    todo.push(a);
+  });
+  if(dups.length){
+    lines.push('检测到 '+dups.length+' 条重复账号，已剔除：');
+    lines.push(...dups);
+    res.textContent=lines.join('\n');
+  }
+  for(let i=0;i<todo.length;i++){
+    const a=todo[i];
     try{
       await api('/api/admin/accounts',{method:'POST',body:a});
       lines.push('✓ '+a.name+' '+a.email+' 已提交');
@@ -436,7 +471,8 @@ async function submitBatchAdd(){
     await new Promise(r=>setTimeout(r,800));
   }
   btn.disabled=false;
-  lines.push('完成');
+  if(!todo.length)lines.push('未提交任何新账号');
+  else lines.push('完成：新提交 '+todo.length+' 条');
   res.textContent=lines.join('\n');
   refresh();
 }
@@ -509,7 +545,7 @@ async function loadVideos(){
   const total=r.total||0;
   const avail=r.available||0;
   q('#videoStat').textContent=`视频总数：${total}（正常 ${avail} / 已删除 ${total-avail}）`;
-  allVideoIds=(r.videos||[]).filter(v=>v.video_url&&v.file_exists!==false).map(v=>v.id);
+  allVideoIds=(r.videos||[]).map(v=>v.id);
   const rows=(r.videos||[]).map(v=>{
     const size=fmtSize(v.video_size||v.file_size);
     const dur=fmtDur(v.video_duration||v.duration);
@@ -517,12 +553,12 @@ async function loadVideos(){
       :(v.ratio&&v.ratio!=='default'?v.ratio:'-');
     const state=v.video_url
       ?(v.file_exists===false?'<span class="badge b-orange">文件缺失</span>':'<span class="badge b-green">正常</span>')
-      :'<span class="badge b-gray">已删除</span>';
-    const ops=v.video_url
-      ?'<div class="video-wrap"><button class="btn" style="margin-right:6px" onclick="playVideo(&quot;'+esc(v.video_url)+'&quot;)">预览</button><button class="btn" style="margin-right:6px" onclick="copyLink(&quot;'+esc(v.video_url)+'&quot;)">复制链接</button><button class="btn btn-danger" onclick="delVideo(\''+v.id+'\')">删除</button></div>'
-      :'—';
+      :'<span class="badge b-gray">文件已删</span>';
+    const ops='<div class="video-wrap">'
+      +(v.video_url?'<button class="btn" style="margin-right:6px" onclick="playVideo(&quot;'+esc(v.video_url)+'&quot;)">预览</button><button class="btn" style="margin-right:6px" onclick="copyLink(&quot;'+esc(v.video_url)+'&quot;)">复制链接</button>':'')
+      +'<button class="btn btn-danger" onclick="delVideo(\''+v.id+'\')">删除</button></div>';
     return [
-      `<input type="checkbox" ${v.video_url&&v.file_exists!==false?'':'disabled'} ${selVideos.has(v.id)?'checked':''} onchange="toggleVideoSel('${v.id}',this.checked)">`,
+      `<input type="checkbox" ${selVideos.has(v.id)?'checked':''} onchange="toggleVideoSel('${v.id}',this.checked)">`,
       fmt(v.created_at),
       dur,
       dim,
@@ -561,7 +597,7 @@ function toggleAllVideos(on){
   loadVideos();
 }
 async function delVideo(id){
-  if(!confirm('确定删除该视频文件？任务记录将保留。'))return;
+  if(!confirm('确定删除该视频？视频文件与任务记录将一并删除，不可恢复。'))return;
   try{await api('/api/admin/videos/'+id,{method:'DELETE'});}catch(e){alert(e.message);}
   selVideos.delete(id);
   refresh();
@@ -569,7 +605,7 @@ async function delVideo(id){
 async function delSelectedVideos(){
   const list=[...selVideos];
   if(!list.length)return;
-  if(!confirm(`确定删除选中的 ${list.length} 个视频文件？任务记录将保留。`))return;
+  if(!confirm(`确定删除选中的 ${list.length} 个视频？文件与任务记录将一并删除，不可恢复。`))return;
   let ok=0;
   for(const id of list){
     try{await api('/api/admin/videos/'+id,{method:'DELETE'});ok++;}
@@ -577,7 +613,7 @@ async function delSelectedVideos(){
   }
   selVideos.clear();
   refresh();
-  if(ok)alert(`已删除 ${ok} 个视频文件`);
+  if(ok)alert(`已删除 ${ok} 个视频（文件与记录）`);
 }
 async function copyLink(url){
   await copy(url);

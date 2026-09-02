@@ -103,6 +103,16 @@ class BrowserPool:
         return self._conn.execute(
             "SELECT * FROM accounts_meta WHERE name=?", (name,)).fetchone()
 
+    def find_accounts_by_email(self, email: str) -> list:
+        """按邮箱（忽略大小写与首尾空格）反查已有账号名，用于添加账号时去重。"""
+        norm = (email or "").strip().lower()
+        if not norm:
+            return []
+        rows = self._conn.execute(
+            "SELECT name FROM accounts_meta WHERE lower(trim(email))=?", (norm,)
+        ).fetchall()
+        return [r["name"] for r in rows]
+
     def used_today(self, account: str) -> int:
         row = self._conn.execute(
             "SELECT used FROM usage WHERE account=? AND day=?",

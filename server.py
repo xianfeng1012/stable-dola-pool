@@ -849,7 +849,8 @@ async def admin_account_verify(name: str, x_admin_key: str | None = Header(defau
 
 
 async def _run_add_job(name: str, email: str, password: str, totp: str):
-    JOBS[name] = {"kind": "add", "status": "running", "error": "", "started_at": time.time()}
+    JOBS[name] = {"kind": "add", "status": "running", "email": email,
+                  "error": "", "started_at": time.time()}
     try:
         async with ADD_ACCOUNT_SEM:
             await add_account_flow(name, email, password, totp)
@@ -866,10 +867,23 @@ async def admin_account_add(body: AccountAdd, x_admin_key: str | None = Header(d
     if not NAME_RE.match(body.name):
         raise HTTPException(400, "invalid account name")
     if body.name in pool.accounts:
-        raise HTTPException(409, "account exists")
+        raise HTTPException(409, "账号名已存在：" + body.name)
     if JOBS.get(body.name, {}).get("status") == "running":
         raise HTTPException(409, "add job running")
-    asyncio.create_task(_run_add_job(body.name, body.email, body.password, body.totp))
+    email = (body.email or "").strip()
+    if not email:
+        raise HTTPException(400, "邮箱不能为空")
+    dups = pool.find_accounts_by_email(email)
+    if dups:
+        raise HTTPException(409, "该邮箱已存在于账号 " + "、".join(dups) + "，请勿重复添加")
+    norm = email.lower()
+    for n, job in JOBS.items():
+        if (job.get("kind") == "add" and job.get("status") == "running"
+                and (job.get("email") or "").strip().lower() == norm):
+            raise HTTPException(409, "该邮箱正在添加中（" + n + "），请勿重复提交")
+    JOBS[body.name] = {"kind": "add", "status": "running", "email": email,
+                       "error": "", "started_at": time.time()}
+    asyncio.create_task(_run_add_job(body.name, email, body.password, body.totp))
     return {"ok": True, "job": "running"}
 
 
@@ -921,7 +935,7 @@ async def admin_videos(limit: int = 100, x_admin_key: str | None = Header(defaul
 
 @app.delete("/api/admin/videos/{task_id}")
 async def admin_video_delete(task_id: str, x_admin_key: str | None = Header(default=None)):
-    """删除视频文件，任务记录保留（清空 video_url 与视频元数据）。"""
+    """删除视频文件并同步删除对应的任务记录。"""
     _admin_auth(x_admin_key)
     row = store.get(task_id)
     if not row or row.get("status") != "completed":
@@ -934,16 +948,8 @@ async def admin_video_delete(task_id: str, x_admin_key: str | None = Header(defa
                 local.unlink()
         except OSError:
             pass
-    store.update(
-        task_id,
-        video_url=None,
-        video_size=None,
-        video_width=None,
-        video_height=None,
-        video_duration=None,
-        video_bitrate=None,
-    )
-    return {"ok": True}
+    store.delete_task(task_id)
+    return {"ok": True, "deleted": task_id}
 
 
 @app.get("/api/admin/stats")
