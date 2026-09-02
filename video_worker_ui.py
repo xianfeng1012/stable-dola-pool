@@ -518,8 +518,8 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
         model_key = "seedance_v2.0"
     else:
         raise ValueError(f"不支持的模型: {model}（当前支持 seedance-2.0 / seedance-2.5）")
-    if duration is not None and duration not in (10, 15, 30):
-        raise ValueError("Dola 当前固定支持 10 秒、15 秒和扩展注入的 30 秒")
+    if duration is not None and duration not in (5, 10, 15, 30):
+        raise ValueError("Dola 当前支持 5/10/15 秒和扩展注入的 30 秒")
     if duration == 30 and not use_extension:
         raise ValueError("30 秒生成需要启用 Dola30 扩展")
     # 30 秒视频（尤其 Seedance 2.5）页面会明确提示约 15 分钟，不能沿用 5 分钟默认值。

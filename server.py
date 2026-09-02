@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +52,7 @@ SIZE_TO_RATIO = {
     "1024x1024": "1:1", "1440x1080": "4:3", "1080x1440": "3:4",
 }
 VIDEO_MAX_ATTEMPTS = 3  # 生成失败自动换号重试上限（超时不重试）
-SUPPORTED_DURATIONS = (10, 15, 30)
+SUPPORTED_DURATIONS = tuple(config.ALL_DURATIONS)  # (5, 10, 15, 30)
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
@@ -211,9 +212,9 @@ def _normalize_allowed_durations(values) -> list[int]:
     try:
         normalized = sorted({int(value) for value in values})
     except (TypeError, ValueError):
-        raise HTTPException(422, "allowed_durations 必须是 10、15、30 的数组")
+        raise HTTPException(422, "allowed_durations 必须是 5/10/15/30 的数组")
     if not normalized or any(value not in SUPPORTED_DURATIONS for value in normalized):
-        raise HTTPException(422, "allowed_durations 只能包含 10、15、30，且至少选择一个")
+        raise HTTPException(422, "allowed_durations 只能包含 5/10/15/30，且至少选择一个")
     return normalized
 
 
@@ -225,9 +226,13 @@ class VideoGenRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     size: str | None = None
     ratio: str | None = None
-    duration: int | None = Field(None, ge=10, le=30)
-    # 对外只接受固定时长 10/15/30，具体集合在接口逻辑中校验。
+    duration: int | None = Field(None, ge=5, le=30)
+    # 参考图：兼容各画布工具的常见字段形态（字符串/数组/{"url": ...}）
     reference_images: list[str] = Field(default_factory=list)
+    image_url: Any = None
+    image: Any = None
+    input_image: Any = None
+    input_images: Any = None
 
 
 class TaskResponse(BaseModel):
@@ -253,8 +258,18 @@ def _normalize_model(model: str) -> str:
     return "seedance-2.0"
 
 
+def _model_durations(model: str) -> tuple[int, ...]:
+    """按模型返回允许时长（seedance-2.5: 10/30；seedance-2.0: 5/10/15）。"""
+    return tuple(config.MODEL_DURATION_COSTS.get(_normalize_model(model), {}).keys())
+
+
+def _duration_cost(model: str, duration: int) -> int:
+    """单次出片消耗的额度点数（按用户确认的矩阵）。"""
+    return config.MODEL_DURATION_COSTS.get(_normalize_model(model), {}).get(duration, 1)
+
+
 def _pick_duration(requested, allowed: list[int]) -> int:
-    """把 Ark 请求的时长映射到 dola 支持的 10/15/30，优先取不小于请求值的档位。"""
+    """把 Ark 请求的时长映射到允许档位，优先取不小于请求值的档位。"""
     try:
         requested = max(1, int(requested or 0))
     except (TypeError, ValueError):
@@ -264,6 +279,31 @@ def _pick_duration(requested, allowed: list[int]) -> int:
         if duration >= requested:
             return duration
     return allowed[-1]
+
+
+def _normalize_image_refs(*fields) -> list[str]:
+    """兼容各画布工具常见的图片字段形态（字符串/列表/{"url": ...}）。"""
+    out: list[str] = []
+    for value in fields:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                out.append(value.strip())
+        elif isinstance(value, dict):
+            url = value.get("url")
+            if isinstance(url, str) and url.strip():
+                out.append(url.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    out.append(item.strip())
+                elif isinstance(item, dict):
+                    url = item.get("url")
+                    if isinstance(url, str) and url.strip():
+                        out.append(url.strip())
+    seen = set()
+    return [u for u in out if not (u in seen or seen.add(u))]
 
 
 def _map_ark_ratio(ratio) -> str | None:
@@ -344,7 +384,8 @@ async def _resume_task(row: dict):
         result = await pool.resume_video(
             row["account"], row["conversation_id"], remaining, on_poll=on_poll,
             duration=row.get("duration"),
-            ratio=None if row.get("ratio") == "default" else row.get("ratio"))
+            ratio=None if row.get("ratio") == "default" else row.get("ratio"),
+            cost=_duration_cost(row.get("model"), row.get("duration") or 10))
         public_url = f"{config.PUBLIC_BASE}/videos/{Path(result['local_path']).name}"
         meta = _video_metadata(result["local_path"], row.get("duration"), row.get("ratio"))
         store.update(task_id, status="completed", video_url=public_url,
@@ -397,21 +438,27 @@ async def create_video(req: VideoGenRequest, authorization: str | None = Header(
     client = _auth(authorization)
     duration = req.duration or 10
     ratio = _resolve_ratio(req.size, req.ratio)
-    return await _submit_task(client, req.model, req.prompt, ratio, duration, req.reference_images)
+    refs = _normalize_image_refs(
+        req.reference_images, req.image_url, req.image,
+        req.input_image, req.input_images,
+    )
+    if refs:
+        print(f"[api] 收到参考图 {len(refs)} 张: {refs[0][:80]}", flush=True)
+    return await _submit_task(client, req.model, req.prompt, ratio, duration, refs)
 
 
 async def _submit_task(client, model, prompt, ratio, duration, reference_images):
     """公共受理逻辑：校验模型/时长/账号池 -> 入队 -> 后台跑，返回 TaskResponse。"""
-    if duration not in SUPPORTED_DURATIONS:
-        raise HTTPException(422, "当前固定支持 10 秒、15 秒和 30 秒视频")
+    model_key = _normalize_model(model)
+    model_durations = _model_durations(model_key)
+    if duration not in model_durations:
+        raise HTTPException(
+            422,
+            f"{model_key} 仅支持 {'/'.join(map(str, model_durations))} 秒视频"
+            f"（收到 {duration} 秒）",
+        )
     if duration not in client["allowed_durations"]:
         raise HTTPException(422, f"当前 API Key 不允许生成 {duration} 秒视频")
-    model_key = model.lower().replace("-", "_")
-    if model_key not in (
-        "seedance_2.0", "seedance_2.5", "seedance_v2.0", "seedance_v2.5",
-        "seedance_20", "seedance_25", "seedance_v20", "seedance_v25",
-    ):
-        raise HTTPException(422, "当前支持的模型为 seedance-2.0 和 seedance-2.5")
     try:
         reference_images = await validate_reference_urls(reference_images)
     except ValueError as exc:
@@ -523,12 +570,20 @@ async def ark_create_task(body: dict, authorization: str | None = Header(default
             url = url_obj.get("url") if isinstance(url_obj, dict) else url_obj
             if isinstance(url, str) and url.strip():
                 reference_images.append(url.strip())
+    # 顶层兼容：部分画布工具把图片放在顶层 image_url/image 字段
+    reference_images = _normalize_image_refs(
+        reference_images, body.get("image_url"), body.get("image"),
+        body.get("input_image"), body.get("input_images"),
+    )
     prompt = "\n".join(prompt_parts).strip()
     if not prompt:
         raise HTTPException(422, "content 中缺少 text 提示词")
     model = _normalize_model(body.get("model"))
     ratio = _map_ark_ratio(body.get("ratio"))
-    duration = _pick_duration(body.get("duration"), client["allowed_durations"])
+    if reference_images:
+        print(f"[api] Ark 收到参考图 {len(reference_images)} 张: {reference_images[0][:80]}", flush=True)
+    allowed = [d for d in client["allowed_durations"] if d in _model_durations(model)]
+    duration = _pick_duration(body.get("duration"), allowed)
     resp = await _submit_task(client, model, prompt, ratio, duration, reference_images)
     return {"id": resp.id, "status": resp.status}
 
@@ -712,11 +767,14 @@ async def admin_videos(limit: int = 100, x_admin_key: str | None = Header(defaul
     rows = store.recent_tasks(min(max(limit, 1), 500))
     out = []
     for r in rows:
-        if r.get("status") != "completed" or not r.get("video_url"):
+        if r.get("status") != "completed":
             continue
         item = dict(r)
-        local = Path(config.DOWNLOAD_DIR) / Path(item["video_url"]).name
-        if local.exists():
+        if item.get("video_url"):
+            local = Path(config.DOWNLOAD_DIR) / Path(item["video_url"]).name
+        else:
+            local = None
+        if local and local.exists():
             item["file_exists"] = True
             try:
                 item["file_size"] = os.path.getsize(local)
@@ -729,6 +787,33 @@ async def admin_videos(limit: int = 100, x_admin_key: str | None = Header(defaul
         out.append(item)
     out.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
     return {"videos": out}
+
+
+@app.delete("/api/admin/videos/{task_id}")
+async def admin_video_delete(task_id: str, x_admin_key: str | None = Header(default=None)):
+    """删除视频文件，任务记录保留（清空 video_url 与视频元数据）。"""
+    _admin_auth(x_admin_key)
+    row = store.get(task_id)
+    if not row or row.get("status") != "completed":
+        raise HTTPException(404, "task not found")
+    url = row.get("video_url")
+    if url:
+        local = Path(config.DOWNLOAD_DIR) / Path(url).name
+        try:
+            if local.exists():
+                local.unlink()
+        except OSError:
+            pass
+    store.update(
+        task_id,
+        video_url=None,
+        video_size=None,
+        video_width=None,
+        video_height=None,
+        video_duration=None,
+        video_bitrate=None,
+    )
+    return {"ok": True}
 
 
 @app.get("/api/admin/stats")

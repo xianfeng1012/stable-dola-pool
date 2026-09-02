@@ -109,13 +109,25 @@ class BrowserPool:
         ).fetchone()
         return row[0] if row else 0
 
-    def _claim(self, account: str):
+    def _claim(self, account: str, cost: int = 1):
+        """按额度点数记账：出片/占额度事件扣除 cost 点（默认 1）。"""
+        if cost <= 0:
+            cost = 1
         self._conn.execute(
-            "INSERT INTO usage(account, day, used) VALUES (?,?,1) "
-            "ON CONFLICT(account, day) DO UPDATE SET used=used+1",
-            (account, date.today().isoformat()),
+            "INSERT INTO usage(account, day, used) VALUES (?,?,?) "
+            "ON CONFLICT(account, day) DO UPDATE SET used=used+?",
+            (account, date.today().isoformat(), cost, cost),
         )
         self._conn.commit()
+
+    def _duration_cost(self, model: str, duration: int) -> int:
+        """按用户确认的模型-时长矩阵返回单次出片消耗的点数。"""
+        m = (model or "").lower().replace("_", "-")
+        if "2.5" in m or "2-5" in m:
+            m = "seedance-2.5"
+        else:
+            m = "seedance-2.0"
+        return config.MODEL_DURATION_COSTS.get(m, {}).get(duration, 1)
 
     def _next_limit_reset(self) -> float:
         """计算下一次每日额度刷新时间（默认日本时间次日 00:00）。"""
@@ -298,7 +310,7 @@ class BrowserPool:
 
     async def resume_video(self, account: str, conversation_id: str, timeout: int,
                            on_poll=None, duration: int | None = None,
-                           ratio: str | None = None) -> dict:
+                           ratio: str | None = None, cost: int = 1) -> dict:
         """恢复已受理会话；不参与选号，也不因账号当前额度状态跳过。"""
         async with self.semaphore:
             lock = self._locks.setdefault(account, asyncio.Lock())
@@ -309,14 +321,14 @@ class BrowserPool:
                     result = await resume_video(account, conversation_id, timeout,
                                                 on_poll=on_poll, on_balance=on_balance,
                                                 duration=duration, ratio=ratio)
-                    self._claim(account)
+                    self._claim(account, cost)
                     self._conn.execute(
                         "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
                         (time.time(), account))
                     self._conn.commit()
                     return result
                 except TimeoutError:
-                    self._claim(account)
+                    self._claim(account, cost)
                     self._conn.commit()
                     raise
 
@@ -333,13 +345,15 @@ class BrowserPool:
           Dola 端可能仍在生成，换号重提会重复扣额度/重复出片。
         """
         async with self.semaphore:
+            cost = self._duration_cost(model, duration)
             last_err = None
             attempt = 0
             tried: set[str] = set()
             while attempt < max_attempts:
                 picked = False
                 for a in self.list_accounts():
-                    if not self._schedulable(a) or a["name"] in tried:
+                    if (not self._schedulable(a) or a["name"] in tried
+                            or a["remaining"] < cost):
                         continue
                     account = a["name"]
                     lock = self._locks.setdefault(account, asyncio.Lock())
@@ -361,7 +375,7 @@ class BrowserPool:
                                 account, prompt, ratio, duration, model=model,
                                 on_conversation_id=on_conversation_id, on_poll=on_poll,
                                 on_balance=on_balance, reference_image_paths=reference_image_paths)
-                            self._claim(account)
+                            self._claim(account, cost)
                             self._conn.execute(
                                 "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
                                 (time.time(), account))
@@ -377,7 +391,7 @@ class BrowserPool:
                             last_err = e
                         except CreditError as e:
                             print(f"[pool] {account} 额度不足，换号: {e}", flush=True)
-                            self._claim(account)
+                            self._claim(account, cost)
                             last_err = e
                         except RiskControlError as e:
                             print(f"[pool] {account} 风控，冷却 30 分钟，换号: {e}", flush=True)
@@ -389,7 +403,7 @@ class BrowserPool:
                         except TimeoutError as e:
                             # 请求已拿到 conversation_id 后仍可能在 Dola 端继续生成。
                             # 绝不能因为本地轮询超时就换号重提，否则会重复扣额度/重复出片。
-                            self._claim(account)
+                            self._claim(account, cost)
                             self._conn.execute(
                                 "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
                                 (time.time(), account))

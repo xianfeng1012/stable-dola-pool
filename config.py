@@ -65,8 +65,17 @@ LIMIT_RESET_TZ = os.getenv("DOLA_LIMIT_RESET_TZ", "Asia/Tokyo")
 # 生成前余额预检的保守最低积分；Dola 当前 2.5/30s 实测成本为 2。
 VIDEO_REQUIRED_POINTS = int(os.getenv("DOLA_VIDEO_REQUIRED_POINTS", "2"))
 
-# 每账号每日视频生成上限（官方每日免费额度随账号/区域浮动，超出后 Dola 会返回每日上限错误自动停号）
+# 每账号每日视频生成额度（点数；官方每日免费额度随账号/区域浮动，超出后 Dola 会返回每日上限错误自动停号）
 DAILY_LIMIT = int(os.getenv("DOLA_DAILY_LIMIT", "4"))
+
+# ---- 模型-时长额度规则（2026-09-02 用户确认，反直觉但照实执行）----
+# 每次出片消耗的点数 = MODEL_DURATION_COSTS[模型][时长]；账号每日共 DAILY_LIMIT 点。
+# seedance-2.5 仅支持 10s/30s；seedance-2.0 仅支持 5s/10s/15s；其它时长一律拒绝。
+MODEL_DURATION_COSTS = {
+    "seedance-2.5": {10: 4, 30: 2},
+    "seedance-2.0": {5: 1, 10: 1, 15: 1},
+}
+ALL_DURATIONS = sorted({d for costs in MODEL_DURATION_COSTS.values() for d in costs})
 
 
 # 公网参考图片下载限制

@@ -130,7 +130,10 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
     <div class="card">
       <div class="toolbar">
         <h3 style="margin:0">视频管理（已生成的视频）</h3>
-        <button class="btn" onclick="loadVideos()">刷新</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-danger" id="btnDelVideos" onclick="delSelectedVideos()" disabled>删除选中</button>
+          <button class="btn" onclick="loadVideos()">刷新</button>
+        </div>
       </div>
       <div id="videosTable"></div>
     </div>
@@ -215,7 +218,7 @@ async function loadDash(){
     <div class="stat s1"><div class="v">${st.today_completed}</div><div class="l">今日出片</div></div>
     <div class="stat s2"><div class="v">${st.today_failed}</div><div class="l">今日失败</div></div>
     <div class="stat s3"><div class="v">${sr}</div><div class="l">成功率</div></div>
-    <div class="stat s4"><div class="v">${st.available_accounts}/${st.total_accounts}</div><div class="l">可用号 · 剩余 ${st.total_remaining} 片</div></div>`;
+    <div class="stat s4"><div class="v">${st.available_accounts}/${st.total_accounts}</div><div class="l">可用号 · 剩余 ${st.total_remaining} 点</div></div>`;
   const max=Math.max(1,...st.per_day.map(d=>d.completed+d.failed));
   q('#chart').innerHTML=st.per_day.map(d=>`
     <div class="col">
@@ -226,12 +229,12 @@ async function loadDash(){
       <div class="lbl">${d.day}</div>
     </div>`).join('');
   q('#perAccount').innerHTML=table(
-    ['账号','状态','调度','今日剩余','累计出片','最近使用'],
+    ['账号','状态','调度','剩余额度','累计出片','最近使用'],
     st.per_account.map(a=>[
       accLabel(a),
       statusBadge(a),
       `<label class="sw"><input type="checkbox" ${a.scheduling?'checked':''} onchange="setSched('${a.name}',this.checked)"><i></i></label>`,
-      `<b>${a.remaining}</b> / ${a.limit}<span class="tiny">（剩余/上限）</span>`,
+      `<b>${a.remaining}</b> / ${a.limit}<span class="tiny">（点数/上限）</span>`,
       a.completed_total||0,
       fmt(a.last_used_at)
     ])
@@ -285,7 +288,7 @@ async function loadAccounts(){
   });
   q('#accountsTable').innerHTML=table(
     ['<input type="checkbox" id="selAll" onchange="toggleAll(this.checked)" title="全选/取消全选">',
-     '内部账号','名称','状态','调度','今日剩余','最近使用','创建时间','操作'],rows);
+     '内部账号','名称','状态','调度','剩余额度','最近使用','创建时间','操作'],rows);
   const b=q('#btnDelSel');b.disabled=selAccounts.size===0;
   b.textContent=selAccounts.size?`删除选中（${selAccounts.size}）`:'删除选中';
   const selAll=q('#selAll');
@@ -476,6 +479,8 @@ function playVideo(url){q('#videoEl').src=url;show('videoModal');}
 function closeVideo(){q('#videoEl').pause();q('#videoEl').src='';hide('videoModal');}
 
 /* ---- 视频管理 ---- */
+let selVideos=new Set();
+let allVideoIds=[];
 function fmtSize(b){
   if(!b||b<=0)return '-';
   if(b>=1<<30)return (b/(1<<30)).toFixed(2)+' GB';
@@ -490,25 +495,75 @@ function fmtDur(s){
 }
 async function loadVideos(){
   const r=await api('/api/admin/videos');
+  allVideoIds=(r.videos||[]).filter(v=>v.video_url&&v.file_exists!==false).map(v=>v.id);
   const rows=(r.videos||[]).map(v=>{
     const size=fmtSize(v.video_size||v.file_size);
     const dur=fmtDur(v.video_duration||v.duration);
     const dim=(v.video_width&&v.video_height)?v.video_width+'×'+v.video_height
       :(v.ratio&&v.ratio!=='default'?v.ratio:'-');
+    const state=v.video_url
+      ?(v.file_exists===false?'<span class="badge b-orange">文件缺失</span>':'<span class="badge b-green">正常</span>')
+      :'<span class="badge b-gray">已删除</span>';
+    const ops=v.video_url
+      ?'<div class="video-wrap"><button class="btn" style="margin-right:6px" onclick="playVideo(&quot;'+esc(v.video_url)+'&quot;)">预览</button><button class="btn" style="margin-right:6px" onclick="copyLink(&quot;'+esc(v.video_url)+'&quot;)">复制链接</button><button class="btn btn-danger" onclick="delVideo(\''+v.id+'\')">删除</button></div>'
+      :'—';
     return [
+      `<input type="checkbox" ${v.video_url&&v.file_exists!==false?'':'disabled'} ${selVideos.has(v.id)?'checked':''} onchange="toggleVideoSel('${v.id}',this.checked)">`,
       fmt(v.created_at),
       dur,
       dim,
       size,
       v.account||'-',
       v.model||'-',
+      state,
       '<span class="prompt" title="'+esc(v.prompt||'')+'">'+esc(v.prompt||'')+'</span>',
-      v.video_url
-        ?'<div class="video-wrap"><button class="btn" style="margin-right:6px" onclick="playVideo(&quot;'+esc(v.video_url)+'&quot;)">预览</button><button class="btn" onclick="copyLink(&quot;'+esc(v.video_url)+'&quot;)">复制链接</button></div>'
-        :'—'
+      ops
     ];
   });
-  q('#videosTable').innerHTML=table(['生成时间','时长','尺寸','大小','账号','模型','提示词','操作'],rows);
+  q('#videosTable').innerHTML=table(
+    ['<input type="checkbox" id="selAllV" onchange="toggleAllVideos(this.checked)" title="全选/取消全选">',
+     '生成时间','时长','尺寸','大小','账号','模型','状态','提示词','操作'],rows);
+  const b=q('#btnDelVideos');b.disabled=selVideos.size===0;
+  b.textContent=selVideos.size?`删除选中（${selVideos.size}）`:'删除选中';
+  const selAll=q('#selAllV');
+  if(selAll){
+    selAll.checked=selVideos.size>0&&selVideos.size===allVideoIds.length;
+    selAll.indeterminate=selVideos.size>0&&selVideos.size<allVideoIds.length;
+  }
+}
+function toggleVideoSel(id,on){
+  if(on)selVideos.add(id);else selVideos.delete(id);
+  const b=q('#btnDelVideos');b.disabled=selVideos.size===0;
+  b.textContent=selVideos.size?`删除选中（${selVideos.size}）`:'删除选中';
+  const selAll=q('#selAllV');
+  if(selAll){
+    selAll.checked=selVideos.size>0&&selVideos.size===allVideoIds.length;
+    selAll.indeterminate=selVideos.size>0&&selVideos.size<allVideoIds.length;
+  }
+}
+function toggleAllVideos(on){
+  selVideos.clear();
+  if(on)allVideoIds.forEach(id=>selVideos.add(id));
+  loadVideos();
+}
+async function delVideo(id){
+  if(!confirm('确定删除该视频文件？任务记录将保留。'))return;
+  try{await api('/api/admin/videos/'+id,{method:'DELETE'});}catch(e){alert(e.message);}
+  selVideos.delete(id);
+  refresh();
+}
+async function delSelectedVideos(){
+  const list=[...selVideos];
+  if(!list.length)return;
+  if(!confirm(`确定删除选中的 ${list.length} 个视频文件？任务记录将保留。`))return;
+  let ok=0;
+  for(const id of list){
+    try{await api('/api/admin/videos/'+id,{method:'DELETE'});ok++;}
+    catch(e){alert(id+' 删除失败：'+e.message);}
+  }
+  selVideos.clear();
+  refresh();
+  if(ok)alert(`已删除 ${ok} 个视频文件`);
 }
 async function copyLink(url){
   await copy(url);
@@ -544,8 +599,8 @@ async function delKey(key){
   try{await api('/api/admin/keys/'+encodeURIComponent(key),{method:'DELETE'});}catch(e){alert(e.message);}refresh();
 }
 function durationChecks(values){
-  values=values||[10,15,30];
-  return [10,15,30].map(v=>`<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px"><input type="checkbox" id="f_d${v}" ${values.includes(v)?'checked':''}>${v}秒</label>`).join('');
+  values=values||[5,10,15,30];
+  return [5,10,15,30].map(v=>`<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px"><input type="checkbox" id="f_d${v}" ${values.includes(v)?'checked':''}>${v}秒</label>`).join('');
 }
 function openCreateKey(){
   showDlg(`<h2>创建 API 密钥</h2>

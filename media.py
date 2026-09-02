@@ -1,5 +1,6 @@
 """公网参考素材下载与安全校验（当前先支持图片）。"""
 import asyncio
+import base64
 import ipaddress
 import socket
 import tempfile
@@ -13,12 +14,41 @@ from PIL import Image
 import config
 
 _ALLOWED_IMAGE_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
+_DATA_URL_RE = "data:image/"
+
+
+def _is_data_image(url: str) -> bool:
+    return isinstance(url, str) and url.startswith(_DATA_URL_RE) and ";base64," in url
+
+
+def _decode_data_image(url: str) -> tuple[bytes, str]:
+    """解码 data:image/xxx;base64,... 参考图；返回 (字节, 扩展名)。"""
+    head, _, b64 = url.partition(",")
+    try:
+        data = base64.b64decode(b64, validate=True)
+    except Exception as exc:
+        raise ValueError("参考图片 data URL base64 无效") from exc
+    if len(data) > config.REFERENCE_IMAGE_MAX_BYTES:
+        raise ValueError("参考图片超过单文件大小限制")
+    try:
+        with Image.open(BytesIO(data)) as image:
+            image.verify()
+            fmt = image.format
+    except Exception as exc:
+        raise ValueError("参考文件不是有效图片") from exc
+    suffix = _ALLOWED_IMAGE_FORMATS.get(fmt)
+    if not suffix:
+        raise ValueError("参考图片仅支持 JPEG、PNG、WEBP")
+    return data, suffix
 
 
 def validate_public_url(url: str) -> str:
     """只接受公网 HTTP(S) URL，拒绝 localhost/内网/带认证信息的 URL。"""
     if not isinstance(url, str) or len(url) > 4096:
         raise ValueError("参考图片 URL 无效")
+    if _is_data_image(url):
+        _decode_data_image(url)
+        return url
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("参考图片只支持 http/https 公网 URL")
@@ -51,6 +81,9 @@ def awaitable_getaddrinfo(host: str) -> list[str]:
 async def _validate_url_async(url: str) -> str:
     if not isinstance(url, str) or len(url) > 4096:
         raise ValueError("参考图片 URL 无效")
+    if _is_data_image(url):
+        _decode_data_image(url)
+        return url
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("参考图片只支持 http/https 公网 URL")
@@ -154,7 +187,13 @@ async def download_reference_images(urls: list[str], task_id: str) -> tuple[Path
         async with aiohttp.ClientSession() as session:
             paths = []
             for index, url in enumerate(urls):
-                paths.append(str(await download_one_image(session, url, root / f"image_{index}")))
+                if _is_data_image(url):
+                    data, suffix = _decode_data_image(url)
+                    path = root / f"image_{index}{suffix}"
+                    path.write_bytes(data)
+                    paths.append(str(path))
+                else:
+                    paths.append(str(await download_one_image(session, url, root / f"image_{index}")))
         return root, paths
     except Exception:
         for child in root.glob("*"):
