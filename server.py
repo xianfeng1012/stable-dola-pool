@@ -385,9 +385,14 @@ async def _run_task(task_id, model, prompt, ratio, duration, reference_images, c
         def on_poll(now):
             store.update(task_id, last_poll_at=now)
 
+        tried_accs: list[str] = []
+
         def on_account_try(account, attempt):
+            tried_accs.append(account)
             store.update(task_id, status="processing", account=account,
-                         attempt=attempt, last_poll_at=time.time())
+                         attempt=attempt,
+                         attempted_accounts=json.dumps(tried_accs, ensure_ascii=False),
+                         last_poll_at=time.time())
 
         reference_root, reference_paths = await download_reference_images(
             reference_images or [], task_id)

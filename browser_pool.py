@@ -159,12 +159,8 @@ class BrowserPool:
         self._conn.commit()
 
     def _mark_daily_limit(self, account: str, reason: str = ""):
-        """Dola 明确返回每日上限：封顶计数并标记到恢复时间，期间完全跳过该号。"""
-        self._conn.execute(
-            "INSERT INTO usage(account, day, used) VALUES (?,?,?) "
-            "ON CONFLICT(account, day) DO UPDATE SET used=MAX(used, excluded.used)",
-            (account, date.today().isoformat(), DAILY_LIMIT),
-        )
+        """Dola 明确返回每日上限：未成功不扣本地点数（2026-09-02 规则），
+        只把账号限流标记到次日零点，期间跳过该号。"""
         self._conn.execute(
             "UPDATE accounts_meta SET last_used_at=?, rate_limited_until=?, limit_reason=? WHERE name=?",
             (time.time(), self._next_limit_reset(), reason[:300], account),
@@ -328,8 +324,6 @@ class BrowserPool:
                     self._conn.commit()
                     return result
                 except TimeoutError:
-                    self._claim(account, cost)
-                    self._conn.commit()
                     raise
 
     async def generate_video(self, prompt: str, ratio: str = None, duration: int = None,
@@ -349,6 +343,7 @@ class BrowserPool:
             last_err = None
             attempt = 0
             tried: set[str] = set()
+            tried_order: list[str] = []
             while attempt < max_attempts:
                 picked = False
                 for a in self.list_accounts():
@@ -391,7 +386,6 @@ class BrowserPool:
                             last_err = e
                         except CreditError as e:
                             print(f"[pool] {account} 额度不足，换号: {e}", flush=True)
-                            self._claim(account, cost)
                             last_err = e
                         except RiskControlError as e:
                             print(f"[pool] {account} 风控，冷却 30 分钟，换号: {e}", flush=True)
@@ -402,8 +396,8 @@ class BrowserPool:
                             last_err = e
                         except TimeoutError as e:
                             # 请求已拿到 conversation_id 后仍可能在 Dola 端继续生成。
-                            # 绝不能因为本地轮询超时就换号重提，否则会重复扣额度/重复出片。
-                            self._claim(account, cost)
+                            # 未成功出片不扣点（2026-09-02 规则）；也绝不能换号重提
+                            # （Dola 端可能仍在生成，会重复出片）。
                             self._conn.execute(
                                 "UPDATE accounts_meta SET last_used_at=? WHERE name=?",
                                 (time.time(), account))
@@ -416,6 +410,7 @@ class BrowserPool:
                             print(f"[pool] {account} 生成失败（第 {attempt} 次），换号重试: {e}", flush=True)
                             last_err = e
                         tried.add(account)
+                        tried_order.append(account)
                         if attempt >= max_attempts:
                             break
                 if not picked:
@@ -429,7 +424,8 @@ class BrowserPool:
                     f"429: 所有已开启调度的账号均已达到 Dola 每日视频上限: {last_err or '无号'}"
                 )
             if last_err is not None:
+                chain = "、".join(tried_order) if tried_order else str(last_err)
                 raise RuntimeError(
-                    f"连续 {attempt} 次生成均失败（已自动换号重试）: {str(last_err)[:300]}"
+                    f"连续 {attempt} 次生成均失败（依次尝试账号: {chain}）: {str(last_err)[:300]}"
                 )
             raise RuntimeError(f"号池无可用账号（调度关闭/冷却/额度用完）: {last_err or '无号'}")

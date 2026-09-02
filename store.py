@@ -75,6 +75,7 @@ class TaskStore:
                 ("video_duration", "REAL"),
                 ("video_bitrate", "INTEGER"),
                 ("attempt", "INTEGER DEFAULT 0"),
+                ("attempted_accounts", "TEXT"),
             ):
                 try:
                     self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")

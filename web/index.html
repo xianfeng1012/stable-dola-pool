@@ -457,13 +457,23 @@ async function submitAddAccount(){
 }
 
 /* ---- 任务列表 ---- */
+function accChain(t){
+  let arr=[];
+  try{arr=JSON.parse(t.attempted_accounts||'[]');}catch(e){}
+  if(!arr.length&&t.account)arr=[t.account];
+  if(!arr.length)return '-';
+  const txt=arr.join(' → ');
+  return arr.length>1
+    ?'<span class="tiny" title="换号顺序：'+esc(txt)+'">'+arr.map(esc).join('<span style="color:var(--gray)"> → </span>')+'</span>'
+    :esc(arr[0]);
+}
 async function loadTasks(){
   const r=await api('/api/admin/tasks?limit=50');
   const sb={'queued':'<span class="badge b-gray">排队中</span>','processing':'<span class="badge b-blue">生成中</span>','completed':'<span class="badge b-green">完成</span>','failed':'<span class="badge b-red">失败</span>'};
   const rows=r.tasks.map(t=>[
     '<span class="tiny" title="'+esc(t.id)+'">'+t.id.replace('video_','').slice(0,10)+'</span>',
     '<span class="prompt" title="'+esc(t.prompt||'')+'">'+esc(t.prompt||'')+'</span>',
-    t.account||'-',
+    accChain(t),
     t.api_key_name||'—',
     (t.duration||10)+'秒',
     sb[t.status]||'<span class="badge b-gray">'+esc(t.status)+'</span>',
