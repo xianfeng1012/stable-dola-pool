@@ -275,6 +275,17 @@ class TaskStore:
                 ).fetchall()
         return [dict(r) for r in rows]
 
+    def video_stats(self) -> dict:
+        """视频管理统计：全部已完成记录数、仍保留视频文件的记录数。"""
+        with _LOCK:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN video_url IS NOT NULL AND video_url != '' "
+                "THEN 1 ELSE 0 END) AS available "
+                "FROM tasks WHERE status='completed'"
+            ).fetchone()
+        return {"total": row["total"] or 0, "available": row["available"] or 0}
+
     def key_usage(self, api_key_hash: str, day: str | None = None) -> dict:
         day = day or datetime.date.today().isoformat()
         with _LOCK:

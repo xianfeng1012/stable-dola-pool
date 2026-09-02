@@ -250,17 +250,44 @@ def _resolve_ratio(size, ratio):
     return ratio
 
 
-def _normalize_model(model: str) -> str:
-    """把火山 Ark 的模型 ID 宽松映射到 dola-pool 支持的 seedance 版本。"""
+def _model_version(model) -> str | None:
+    """识别请求里显式声明的 seedance 版本；无法识别返回 None（交给时长规则选择）。"""
     m = (model or "").lower().replace("_", "-")
     if "2.5" in m or "2-5" in m:
         return "seedance-2.5"
-    return "seedance-2.0"
+    if "2.0" in m or "2-0" in m or "v2.0" in m:
+        return "seedance-2.0"
+    return None
 
 
-def _model_durations(model: str) -> tuple[int, ...]:
-    """按模型返回允许时长（seedance-2.5: 10/30；seedance-2.0: 5/10/15）。"""
-    return tuple(config.MODEL_DURATION_COSTS.get(_normalize_model(model), {}).keys())
+def _resolve_model_for_duration(model, duration) -> str | None:
+    """模型-时长组合归一化；无法组合时返回 None。
+
+    - 请求里写明了 2.5/2.0 版本 → 只允许该版本支持的时长，避免悄悄换型号。
+    - 模型名无法识别（如 __schema_probe_invalid_model__）→ 按时长挑一个能生成的版本：
+      5/10/15 秒走 seedance-2.0，30 秒走 seedance-2.5；
+      10 秒两种都支持时默认 seedance-2.0（消耗点数更低）。
+    """
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        return None
+    version = _model_version(model)
+    if version is None:
+        if duration == 30:
+            version = "seedance-2.5"
+        elif duration in (5, 10, 15):
+            version = "seedance-2.0"
+        else:
+            return None
+    if duration not in config.MODEL_DURATION_COSTS.get(version, {}):
+        return None
+    return version
+
+
+def _normalize_model(model: str) -> str:
+    """宽松归一化：显式 2.5 → seedance-2.5，其余一律 seedance-2.0。"""
+    return _model_version(model) or "seedance-2.0"
 
 
 def _duration_cost(model: str, duration: int) -> int:
@@ -516,14 +543,23 @@ async def create_video(request: Request, authorization: str | None = Header(defa
 
 async def _submit_task(client, model, prompt, ratio, duration, reference_images):
     """公共受理逻辑：校验模型/时长/账号池 -> 入队 -> 后台跑，返回 TaskResponse。"""
-    model_key = _normalize_model(model)
-    model_durations = _model_durations(model_key)
-    if duration not in model_durations:
+    resolved = _resolve_model_for_duration(model, duration)
+    if resolved is None:
+        version = _model_version(model)
+        if version is not None:
+            supported = sorted(config.MODEL_DURATION_COSTS.get(version, {}))
+            raise HTTPException(
+                422,
+                f"{version} 仅支持 {'/'.join(map(str, supported))} 秒视频"
+                f"（收到 {duration} 秒）",
+            )
         raise HTTPException(
             422,
-            f"{model_key} 仅支持 {'/'.join(map(str, model_durations))} 秒视频"
-            f"（收到 {duration} 秒）",
+            "不支持的模型/时长组合："
+            f"模型={model!r}，时长={duration}秒"
+            "（seedance-2.5 仅支持 10/30 秒，seedance-2.0 仅支持 5/10/15 秒）",
         )
+    model = resolved
     if duration not in client["allowed_durations"]:
         raise HTTPException(422, f"当前 API Key 不允许生成 {duration} 秒视频")
     try:
@@ -647,12 +683,32 @@ async def ark_create_task(body: dict, authorization: str | None = Header(default
     prompt = "\n".join(prompt_parts).strip()
     if not prompt:
         raise HTTPException(422, "content 中缺少 text 提示词")
-    model = _normalize_model(body.get("model"))
+    requested_model = body.get("model")
     ratio = _map_ark_ratio(body.get("ratio"))
     if reference_images:
         print(f"[api] Ark 收到参考图 {len(reference_images)} 张: {reference_images[0][:80]}", flush=True)
-    allowed = [d for d in client["allowed_durations"] if d in _model_durations(model)]
+    version = _model_version(requested_model)
+    if version is not None:
+        # 显式指定了版本：只在该版本支持的时长里就近取档。
+        allowed = [
+            d for d in client["allowed_durations"]
+            if d in config.MODEL_DURATION_COSTS.get(version, {})
+        ]
+    else:
+        # 模型名无法识别：先按请求时长取档，再由时长挑一个支持的 seedance 版本。
+        allowed = [
+            d for d in client["allowed_durations"]
+            if d in {x for costs in config.MODEL_DURATION_COSTS.values() for x in costs}
+        ]
     duration = _pick_duration(body.get("duration"), allowed)
+    model = _resolve_model_for_duration(requested_model, duration)
+    if model is None:
+        raise HTTPException(
+            422,
+            "不支持的模型/时长组合："
+            f"模型={requested_model!r}，时长={duration}秒"
+            "（seedance-2.5 仅支持 10/30 秒，seedance-2.0 仅支持 5/10/15 秒）",
+        )
     resp = await _submit_task(client, model, prompt, ratio, duration, reference_images)
     return {"id": resp.id, "status": resp.status}
 
@@ -855,7 +911,12 @@ async def admin_videos(limit: int = 100, x_admin_key: str | None = Header(defaul
             item["file_exists"] = False
         out.append(item)
     out.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
-    return {"videos": out}
+    stats = store.video_stats()
+    return {
+        "videos": out,
+        "total": stats["total"],
+        "available": stats["available"],
+    }
 
 
 @app.delete("/api/admin/videos/{task_id}")

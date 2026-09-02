@@ -13,7 +13,8 @@ from pathlib import Path
 
 from dola_client import CreditError
 from video_worker_ui import (
-    AccountLimitedError, CreditInsufficientError, RiskControlError, generate_video, resume_video,
+    AccountLimitedError, CreditInsufficientError, LoginExpiredError, RiskControlError,
+    generate_video, resume_video,
 )
 import config
 
@@ -270,7 +271,8 @@ class BrowserPool:
 
     def _schedulable(self, a: dict) -> bool:
         return (a["scheduling"] and not a["cooling"] and not a["rate_limited"]
-                and not a["quota_blocked"] and a["used_today"] < DAILY_LIMIT
+                and not a["quota_blocked"] and a["login_ok"] != 0
+                and a["used_today"] < DAILY_LIMIT
                 and (a["credit_balance"] is None or a["credit_balance"] >= 2))
 
     @property
@@ -324,6 +326,13 @@ class BrowserPool:
                     self._conn.commit()
                     return result
                 except TimeoutError:
+                    raise
+                except LoginExpiredError as e:
+                    print(f"[pool] {account} 登录态失效，标记需重新登录: {e}", flush=True)
+                    self._conn.execute(
+                        "UPDATE accounts_meta SET login_ok=0, login_checked_at=? WHERE name=?",
+                        (time.time(), account))
+                    self._conn.commit()
                     raise
 
     async def generate_video(self, prompt: str, ratio: str = None, duration: int = None,
@@ -403,6 +412,13 @@ class BrowserPool:
                                 (time.time(), account))
                             self._conn.commit()
                             raise
+                        except LoginExpiredError as e:
+                            print(f"[pool] {account} 登录态失效，标记需重新登录并换号: {e}", flush=True)
+                            self._conn.execute(
+                                "UPDATE accounts_meta SET login_ok=0, login_checked_at=? WHERE name=?",
+                                (time.time(), account))
+                            self._conn.commit()
+                            last_err = e
                         except FileNotFoundError as e:
                             print(f"[pool] {account} profile 缺失，跳过: {e}", flush=True)
                             last_err = e

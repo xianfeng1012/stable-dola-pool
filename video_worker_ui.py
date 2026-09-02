@@ -107,8 +107,35 @@ class CreditInsufficientError(Exception):
     """生成前已知积分不足，不提交视频，换下一个账号。"""
 
 
+class LoginExpiredError(Exception):
+    """Dola 会话已失效（页面出现登录入口），应立即换下一个账号并标记该号需重新登录。"""
+
+
 VIDEO_BTN = "text=動画を作成"          # ja-JP locale 下的入口文案
 CAPTCHA_FRAME_KEY = "bdcaptcha.html"   # 字节 verifycenter 滑块 iframe
+
+
+async def is_logged_out(page) -> bool:
+    """Dola 登录态检测：未登录时页面右上角出现 ログイン/登录 按钮，正常会话没有。"""
+    try:
+        current = (page.url or "").lower()
+        if "/login" in current or "/signin" in current:
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.locator('[class*="login-btn-header"]').first
+        if await loc.count() and await loc.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_text("ログイン", exact=True).first
+        if await loc.count() and await loc.is_visible():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 async def dismiss_popups(page):
@@ -246,13 +273,16 @@ async def attach_reference_images(page, image_paths: list[str]) -> None:
                             for status, url in events)
             # 缩略图出现且每个 prepare/TOS 都成功，才允许发送。
             thumb_count = await page.locator('img[alt]').count()
-            if prepare_count >= expected and tos_count >= expected and thumb_count >= expected:
+            # Dola 会把多张图合并成一次 prepare_upload（实测 2 张图 prepare=1、tos=2），
+            # 因此 prepare 只要求至少 1 次，真正以 TOS 上传数和缩略图数为准。
+            if prepare_count >= 1 and tos_count >= expected and thumb_count >= expected:
                 await page.wait_for_timeout(800)
                 print(f"[upload] 参考图片上传完成: {expected} 张", flush=True)
                 return
             await page.wait_for_timeout(250)
         raise TimeoutError(
-            f"参考图片上传超时: prepare={prepare_count}/{expected}, tos={tos_count}/{expected}"
+            f"参考图片上传超时: prepare={prepare_count}/{expected}, "
+            f"tos={tos_count}/{expected}, 缩略图={thumb_count}/{expected}"
         )
     finally:
         page.remove_listener("response", on_response)
@@ -493,6 +523,9 @@ async def resume_video(account: str, conversation_id: str, timeout: int,
             await page.goto(f"https://www.dola.com/chat/{conversation_id}",
                             timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
+            if await is_logged_out(page):
+                raise LoginExpiredError(
+                    f"{account} 登录态失效（页面出现登录入口），请重新登录该账号")
             return await poll_conversation(
                 account, page, context, conversation_id, timeout, on_poll, on_balance,
                 duration, ratio)
@@ -536,6 +569,9 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
             await page.goto("https://www.dola.com/chat", timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
             await dismiss_popups(page)
+            if await is_logged_out(page):
+                raise LoginExpiredError(
+                    f"{account} 登录态失效（页面出现登录入口），请重新登录该账号")
             cookies = await context.cookies("https://www.dola.com")
             ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
             await _preflight_balance(page, ms_token, fp, config.VIDEO_REQUIRED_POINTS)

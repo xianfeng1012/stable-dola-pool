@@ -135,6 +135,7 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
           <button class="btn" onclick="loadVideos()">刷新</button>
         </div>
       </div>
+      <div id="videoStat" style="margin:10px 0 6px;color:#888;font-size:13px">视频统计加载中…</div>
       <div id="videosTable"></div>
     </div>
   </section>
@@ -505,6 +506,9 @@ function fmtDur(s){
 }
 async function loadVideos(){
   const r=await api('/api/admin/videos');
+  const total=r.total||0;
+  const avail=r.available||0;
+  q('#videoStat').textContent=`视频总数：${total}（正常 ${avail} / 已删除 ${total-avail}）`;
   allVideoIds=(r.videos||[]).filter(v=>v.video_url&&v.file_exists!==false).map(v=>v.id);
   const rows=(r.videos||[]).map(v=>{
     const size=fmtSize(v.video_size||v.file_size);
