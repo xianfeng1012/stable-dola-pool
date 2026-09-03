@@ -20,6 +20,9 @@ import config
 
 DAILY_LIMIT = config.DAILY_LIMIT
 COOLDOWN_SEC = 1800  # 风控冷却 30 分钟
+FAIL_COOLDOWN_SEC = 120   # 任一任务试号失败后的共享冷却：并发任务在此窗口内不再选同一账号
+WAIT_FREE_ACCOUNT_SEC = 15  # 候选账号全被其他任务占用时，最长等待重扫时间
+WAIT_FREE_ACCOUNT_STEP = 2  # 等待重扫间隔（秒）
 
 
 class AllAccountsLimitedError(RuntimeError):
@@ -36,6 +39,7 @@ class BrowserPool:
         self.accounts_dir = Path(accounts_dir)
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self._locks: dict[str, asyncio.Lock] = {}
+        self._fail_until: dict[str, float] = {}
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(
@@ -285,6 +289,13 @@ class BrowserPool:
                 and a["used_today"] < DAILY_LIMIT
                 and (a["credit_balance"] is None or a["credit_balance"] >= 2))
 
+    def _recently_failed(self, account: str) -> bool:
+        """账号刚被任一任务尝试并失败：并发任务应跳过，避免 A 失败后 B 立刻重试同一账号。"""
+        return self._fail_until.get(account, 0) > time.time()
+
+    def _mark_attempt_failed(self, account: str) -> None:
+        self._fail_until[account] = time.time() + FAIL_COOLDOWN_SEC
+
     @property
     def all_accounts_limited(self) -> bool:
         """所有开启调度且未处于风控冷却的账号都已达到每日上限。"""
@@ -363,21 +374,26 @@ class BrowserPool:
             attempt = 0
             tried: set[str] = set()
             tried_order: list[str] = []
+            wait_deadline = 0.0
             while attempt < max_attempts:
                 picked = False
+                waiting_possible = False
                 for a in self.list_accounts():
                     if (not self._schedulable(a) or a["name"] in tried
-                            or a["remaining"] < cost):
+                            or a["remaining"] < cost
+                            or self._recently_failed(a["name"])):
                         continue
                     account = a["name"]
                     lock = self._locks.setdefault(account, asyncio.Lock())
                     # 并发任务跳过已占用账号，避免多个请求排队到同一个 profile。
                     if lock.locked():
+                        waiting_possible = True
                         continue
                     async with lock:
                         if not self._schedulable(next(x for x in self.list_accounts() if x['name'] == account)):
                             continue  # 等待期间状态变化
                         picked = True
+                        wait_deadline = 0.0
                         attempt += 1
                         if on_account_try:
                             on_account_try(account, attempt)
@@ -435,11 +451,19 @@ class BrowserPool:
                         except Exception as e:
                             print(f"[pool] {account} 生成失败（第 {attempt} 次），换号重试: {e}", flush=True)
                             last_err = e
+                        self._mark_attempt_failed(account)
                         tried.add(account)
                         tried_order.append(account)
                         if attempt >= max_attempts:
                             break
                 if not picked:
+                    # 只剩被其他并发任务占用的账号：有界等待重扫，而不是立刻误判“无可用账号”。
+                    if waiting_possible:
+                        if wait_deadline == 0:
+                            wait_deadline = time.time() + WAIT_FREE_ACCOUNT_SEC
+                        if time.time() < wait_deadline:
+                            await asyncio.sleep(WAIT_FREE_ACCOUNT_STEP)
+                            continue
                     break
             if self.all_accounts_quota_blocked:
                 raise AllAccountsQuotaBlockedError(
