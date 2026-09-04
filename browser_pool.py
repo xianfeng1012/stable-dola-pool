@@ -63,7 +63,9 @@ class BrowserPool:
                 quota_blocked_until REAL DEFAULT 0,
                 quota_reason TEXT DEFAULT '',
                 credit_balance INTEGER,
-                credit_checked_at REAL DEFAULT 0
+                credit_checked_at REAL DEFAULT 0,
+                failed_at REAL DEFAULT 0,
+                failed_reason TEXT DEFAULT ''
             )
             """
         )
@@ -77,6 +79,8 @@ class BrowserPool:
             ("quota_reason", "TEXT DEFAULT ''"),
             ("credit_balance", "INTEGER"),
             ("credit_checked_at", "REAL DEFAULT 0"),
+            ("failed_at", "REAL DEFAULT 0"),
+            ("failed_reason", "TEXT DEFAULT ''"),
         ):
             try:
                 self._conn.execute(f"ALTER TABLE accounts_meta ADD COLUMN {column} {definition}")
@@ -182,6 +186,37 @@ class BrowserPool:
         )
         self._conn.commit()
 
+    def _mark_failed(self, account: str, reason: str = ""):
+        """叠加“失败”状态（持久记录，不清到全池重置不罢休）。
+        只用于底层没有自动恢复标记的失败（普通生成失败等），
+        每日上限/积分不足/风控/登录失效仍走各自底层状态，避免误锁。"""
+        self._conn.execute(
+            "UPDATE accounts_meta SET failed_at=?, failed_reason=? WHERE name=?",
+            (time.time(), (reason or "生成失败")[:300], account),
+        )
+        self._conn.commit()
+
+    def _clear_all_failed(self) -> int:
+        """清空所有账号的叠加失败标记（全池兜底重置用）。"""
+        cur = self._conn.execute(
+            "UPDATE accounts_meta SET failed_at=0, failed_reason='' WHERE failed_at>0"
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def _overlay_unlockable(self, cost: int = 1) -> bool:
+        """清掉全部叠加失败标记后，是否至少解锁一个底层健康且满足本次点数的账号。"""
+        for a in self.list_accounts():
+            if not a["failed"]:
+                continue
+            if (a["scheduling"] and not a["cooling"] and not a["rate_limited"]
+                    and not a["quota_blocked"] and a["login_ok"] != 0
+                    and a["used_today"] < DAILY_LIMIT
+                    and (a["credit_balance"] is None or a["credit_balance"] >= 2)
+                    and a["remaining"] >= cost):
+                return True
+        return False
+
     def list_accounts(self) -> list:
         """面板视图：meta + 配额 + 限流状态 + 是否忙合并。"""
         self._clear_expired_rate_limits()
@@ -210,6 +245,9 @@ class BrowserPool:
                 "quota_reason": m["quota_reason"] if m else "",
                 "credit_balance": m["credit_balance"] if m else None,
                 "credit_checked_at": m["credit_checked_at"] if m else 0,
+                "failed_at": m["failed_at"] if m else 0,
+                "failed_reason": m["failed_reason"] if m else "",
+                "failed": bool(m and m["failed_at"] > 0),
                 "used_today": used,
                 "limit": DAILY_LIMIT,
                 "remaining": max(0, DAILY_LIMIT - used),
@@ -286,6 +324,7 @@ class BrowserPool:
     def _schedulable(self, a: dict) -> bool:
         return (a["scheduling"] and not a["cooling"] and not a["rate_limited"]
                 and not a["quota_blocked"] and a["login_ok"] != 0
+                and not a["failed"]
                 and a["used_today"] < DAILY_LIMIT
                 and (a["credit_balance"] is None or a["credit_balance"] >= 2))
 
@@ -364,7 +403,11 @@ class BrowserPool:
         """挑一个可调度且空闲的号出片；失败自动换号重试（最多 max_attempts 次）。
 
         - 额度不足/每日上限/风控/积分不足/通用失败（未真正出片、Dola 报错等）
-          → 换下一个号以同样参数继续（风控号进冷却、上限号封顶）。
+          → 换下一个号以同样参数继续（风控号进冷却、上限号封顶；
+          普通失败/额度报错等无底层恢复的失败额外叠加持久“失败”标记）。
+        - 叠加“失败”标记不清到全池重置：后续任务直接跳过这些号；
+          当某任务扫遍号池一个候选都找不到、且清掉叠加层后能解锁底层健康账号时，
+          触发一次全池重置（只清叠加层）并重跑一轮；仍失败即停止，不循环。
         - TimeoutError（已拿到 conversation_id 后轮询超时）→ 不换号直接失败：
           Dola 端可能仍在生成，换号重提会重复扣额度/重复出片。
         """
@@ -375,6 +418,7 @@ class BrowserPool:
             tried: set[str] = set()
             tried_order: list[str] = []
             wait_deadline = 0.0
+            pool_reset_used = False
             while attempt < max_attempts:
                 picked = False
                 waiting_possible = False
@@ -421,6 +465,7 @@ class BrowserPool:
                             last_err = e
                         except CreditError as e:
                             print(f"[pool] {account} 额度不足，换号: {e}", flush=True)
+                            self._mark_failed(account, f"额度不足: {e}")
                             last_err = e
                         except RiskControlError as e:
                             print(f"[pool] {account} 风控，冷却 30 分钟，换号: {e}", flush=True)
@@ -447,9 +492,11 @@ class BrowserPool:
                             last_err = e
                         except FileNotFoundError as e:
                             print(f"[pool] {account} profile 缺失，跳过: {e}", flush=True)
+                            self._mark_failed(account, f"profile 缺失: {e}")
                             last_err = e
                         except Exception as e:
                             print(f"[pool] {account} 生成失败（第 {attempt} 次），换号重试: {e}", flush=True)
+                            self._mark_failed(account, str(e))
                             last_err = e
                         self._mark_attempt_failed(account)
                         tried.add(account)
@@ -464,6 +511,19 @@ class BrowserPool:
                         if time.time() < wait_deadline:
                             await asyncio.sleep(WAIT_FREE_ACCOUNT_STEP)
                             continue
+                    # 全池无候选：如果只是叠加“失败”标记把所有底层健康号挡住，
+                    # 触发一次全池重置（只清叠加层，不清登录/上限/风控等底层状态）再重跑一轮。
+                    if not pool_reset_used and self._overlay_unlockable(cost):
+                        cleared = self._clear_all_failed()
+                        # 全池重置是显式重试整轮：同时清掉并发防抖的内存冷却，
+                        # 否则刚失败的号仍会被 _recently_failed 挡 120 秒。
+                        self._fail_until.clear()
+                        print(f"[pool] 触发全池失败重置，清除 {cleared} 个叠加标记后重试", flush=True)
+                        pool_reset_used = True
+                        attempt = 0
+                        tried.clear()
+                        wait_deadline = 0.0
+                        continue
                     break
             if self.all_accounts_quota_blocked:
                 raise AllAccountsQuotaBlockedError(

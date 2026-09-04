@@ -248,6 +248,7 @@ function statusBadge(a){
   if(a.rate_limited)return '<span class="badge b-orange">限流至 '+fmt(a.rate_limited_until)+'</span>';
   if(a.quota_blocked)return '<span class="badge b-orange">积分不足至 '+fmt(a.quota_blocked_until)+'</span>';
   if(a.cooling)return '<span class="badge b-orange">冷却至 '+fmtHM(a.cooldown_until)+'</span>';
+  if(a.failed)return '<span class="badge b-red" title="'+esc(a.failed_reason||'生成失败')+'">失败(待全池重置)</span>';
   if(a.login_ok===0)return '<span class="badge b-red">失效</span>';
   if(a.login_ok===1)return '<span class="badge b-green">有效</span>';
   return '<span class="badge b-gray">未验证</span>';
