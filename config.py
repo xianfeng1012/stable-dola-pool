@@ -38,6 +38,9 @@ VIDEO_TIMEOUT = int(os.getenv("DOLA_VIDEO_TIMEOUT", "300"))
 # SQLite 任务库
 DB_PATH = os.getenv("DOLA_DB_PATH", "tasks.db")
 
+# 号池配额/账号元数据库（代理记录也放这里）
+POOL_DB_PATH = os.getenv("DOLA_POOL_DB_PATH", "pool_usage.db")
+
 # 视频下载目录（出片后下载转存，FastAPI 以静态文件方式对外提供）
 DOWNLOAD_DIR = os.getenv("DOLA_DOWNLOAD_DIR", "downloads")
 

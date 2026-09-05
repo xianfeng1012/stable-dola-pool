@@ -4,8 +4,10 @@
 见 DEVELOPMENT.md 第 5 节）。所有需要打开 dola 的脚本都走这里。
 """
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import config
+import proxy_store
 
 
 LAUNCH_ARGS = [
@@ -21,6 +23,39 @@ LAUNCH_ARGS = [
     "--js-flags=--max-old-space-size=256",
     "--disable-features=Translate,MediaRouter,BackForwardCache",
 ]
+
+
+def proxy_kwargs_for(account: str | None = None,
+                     proxy_info: dict | None = None) -> dict | None:
+    """解析某个账号（或 override）应使用的 Playwright proxy 参数。
+
+    账号已绑定代理 → 用绑定代理；否则回落 config.DOLA_PROXY。
+    """
+    info = proxy_info or (proxy_store.get_account_proxy(account) if account else None)
+    if info:
+        kwargs = {
+            "server": f"{info['protocol']}://{info['host']}:{info['port']}",
+        }
+        if info.get("username"):
+            kwargs["username"] = info["username"]
+        if info.get("password"):
+            kwargs["password"] = info["password"]
+        return kwargs
+    raw = (config.PROXY or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urlsplit(raw)
+    if not parts.hostname:
+        return None
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    kwargs = {"server": f"{parts.scheme}://{parts.hostname}:{port}"}
+    if parts.username:
+        kwargs["username"] = unquote(parts.username)
+    if parts.password:
+        kwargs["password"] = unquote(parts.password)
+    return kwargs
 
 
 async def launch_account_context(p, account: str, headless: bool = None, use_extension: bool = False):
@@ -54,8 +89,9 @@ async def launch_account_context(p, account: str, headless: bool = None, use_ext
         "locale": "ja-JP",
         "timezone_id": "Asia/Tokyo",
     }
-    if config.PROXY:
-        kwargs["proxy"] = {"server": config.PROXY}
+    proxy_kwargs = proxy_kwargs_for(account)
+    if proxy_kwargs:
+        kwargs["proxy"] = proxy_kwargs
     return await p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
 
 
@@ -78,10 +114,23 @@ async def check_login_state(account: str) -> bool:
             cookies = await context.cookies("https://www.dola.com")
             if not cookie_value(cookies, "sessionid"):
                 return False
-            return bool(await page.evaluate(
+            if "/security/region-restricted" in page.url:
+                return False
+            has_chat = bool(await page.evaluate(
                 """() => !!(document.querySelector('textarea')
                         || document.querySelector('[contenteditable="true"]')
                         || document.querySelector('input[type="text"]'))"""
             ))
+            # 匿名访问时 Dola 页面也有输入框，必须同时确认没有可见的登录入口
+            visible_login = bool(await page.evaluate(
+                """() => {
+                    const terms = ['ログイン', 'ログ イン', 'log in', 'login', 'sign in', '登录', '登入'];
+                    return [...document.querySelectorAll('button,a,[role="button"]')].some(n => {
+                        const t = (n.innerText || '').trim().toLowerCase();
+                        return t && terms.includes(t) && n.offsetParent !== null;
+                    });
+                }"""
+            ))
+            return bool(has_chat and not visible_login)
         finally:
             await context.close()

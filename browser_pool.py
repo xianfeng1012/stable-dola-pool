@@ -34,8 +34,10 @@ class AllAccountsQuotaBlockedError(RuntimeError):
 
 
 class BrowserPool:
-    def __init__(self, accounts_dir: str = "accounts", db_path: str = "pool_usage.db",
+    def __init__(self, accounts_dir: str = "accounts", db_path: str | None = None,
                  max_concurrency: int = 1):
+        if not db_path:
+            db_path = config.POOL_DB_PATH
         self.accounts_dir = Path(accounts_dir)
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self._locks: dict[str, asyncio.Lock] = {}

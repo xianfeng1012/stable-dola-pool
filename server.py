@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -28,8 +29,26 @@ from pydantic import BaseModel, Field
 import config
 from add_account import add_account_flow
 from browser_pool import AllAccountsLimitedError, AllAccountsQuotaBlockedError, BrowserPool
+from cookie_login import import_cookie_account
 from media import download_reference_images, validate_reference_urls
+from proxy_store import (
+    create_proxy,
+    delete_proxy,
+    get_account_proxy,
+    list_proxies,
+    set_account_proxy,
+    update_proxy,
+)
 from store import PendingTaskLimitExceeded, TaskQuotaExceeded, TaskStore
+from stress_test import run_stress
+from user_store import (
+    create_user as user_create,
+    delete_user as user_delete,
+    get_user as user_get,
+    list_users as user_list,
+    update_user as user_update,
+    verify_login as user_verify,
+)
 
 Path(config.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 Path("web").mkdir(parents=True, exist_ok=True)
@@ -45,6 +64,18 @@ app.mount("/videos", StaticFiles(directory=config.DOWNLOAD_DIR), name="videos")
 JOBS: dict[str, dict] = {}
 # 加号并发上限：1.9GB 内存机器上同时开多个浏览器登录会 OOM，批量添加时逐个排队登录
 ADD_ACCOUNT_SEM = asyncio.Semaphore(1)
+# 浏览器并发压力测试状态（内存态）
+STRESS_RUN: dict = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "recommended": None,
+    "results": [],
+    "logs": [],
+}
+# 管理后台会话（token -> 用户信息），重启后需重新登录
+ADMIN_SESSIONS: dict[str, dict] = {}
+ADMIN_SESSION_TTL = 7 * 86400
 
 SIZE_TO_RATIO = {
     "1280x720": "16:9", "1920x1080": "16:9",
@@ -200,10 +231,16 @@ def _auth(authorization):
 
 
 def _admin_auth(x_admin_key: str | None):
-    if not config.ADMIN_KEY:
-        return
-    if x_admin_key != config.ADMIN_KEY:
-        raise HTTPException(401, "invalid admin key")
+    if not x_admin_key:
+        raise HTTPException(401, "请先登录")
+    session = ADMIN_SESSIONS.get(x_admin_key)
+    if not session or session.get("expires_at", 0) < time.time():
+        ADMIN_SESSIONS.pop(x_admin_key, None)
+        raise HTTPException(401, "登录已过期，请重新登录")
+    user = user_get(session.get("username", ""))
+    if not user or not user.get("enabled"):
+        ADMIN_SESSIONS.pop(x_admin_key, None)
+        raise HTTPException(401, "账号不可用，请重新登录")
 
 
 def _normalize_allowed_durations(values) -> list[int]:
@@ -761,7 +798,50 @@ async def health():
 
 
 class AdminLogin(BaseModel):
-    key: str
+    username: str
+    password: str
+
+
+class AdminUserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "admin"
+
+
+class AdminUserUpdate(BaseModel):
+    username: str | None = None
+    password: str | None = None
+    enabled: bool | None = None
+
+
+class ProxyCreate(BaseModel):
+    name: str
+    protocol: str = "http"
+    host: str
+    port: int = Field(1, ge=1, le=65535)
+    username: str = ""
+    password: str = ""
+    remark: str = ""
+
+
+class ProxyUpdate(BaseModel):
+    name: str | None = None
+    protocol: str | None = None
+    host: str | None = None
+    port: int | None = Field(None, ge=1, le=65535)
+    username: str | None = None
+    password: str | None = None
+    remark: str | None = None
+    enabled: bool | None = None
+
+
+class AccountProxyBind(BaseModel):
+    proxy_id: str | None = None
+
+
+class StressRequest(BaseModel):
+    max_concurrency: int = Field(8, ge=1, le=12)
+    hold_seconds: float = Field(5.0, ge=3.0, le=15.0)
 
 
 class AccountPatch(BaseModel):
@@ -772,9 +852,11 @@ class AccountPatch(BaseModel):
 
 class AccountAdd(BaseModel):
     name: str
-    email: str
-    password: str
-    totp: str
+    email: str = ""
+    password: str = ""
+    totp: str = ""
+    cookies: str = ""
+    cookie_skip_verify: bool = False
 
 
 class KeyCreate(BaseModel):
@@ -796,17 +878,95 @@ class KeyPatch(BaseModel):
 
 @app.post("/api/admin/login")
 async def admin_login(body: AdminLogin):
-    if not config.ADMIN_KEY:
-        return {"ok": True, "auth_required": False}
-    if body.key == config.ADMIN_KEY:
-        return {"ok": True, "auth_required": True}
-    raise HTTPException(401, "wrong admin key")
+    user = user_verify(body.username.strip(), body.password)
+    if not user:
+        raise HTTPException(401, "用户名或密码错误")
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS[token] = {
+        "username": user["username"],
+        "role": user["role"],
+        "expires_at": time.time() + ADMIN_SESSION_TTL,
+    }
+    return {
+        "ok": True,
+        "auth_required": True,
+        "token": token,
+        "username": user["username"],
+        "role": user["role"],
+    }
 
 
 @app.get("/api/admin/accounts")
 async def admin_accounts(x_admin_key: str | None = Header(default=None)):
     _admin_auth(x_admin_key)
-    return {"accounts": pool.list_accounts()}
+    accounts = pool.list_accounts()
+    for acc in accounts:
+        info = get_account_proxy(acc["name"])
+        acc["proxy_id"] = info["id"] if info else None
+        acc["proxy_name"] = info["name"] if info else None
+    return {"accounts": accounts}
+
+
+def _running_add_jobs() -> list[str]:
+    return [name for name, job in JOBS.items()
+            if job.get("status") == "running"]
+
+
+async def _run_stress_job(max_concurrency: int, hold_seconds: float):
+    try:
+        result = await run_stress(max_concurrency, hold_seconds)
+        STRESS_RUN.update(
+            status="completed",
+            finished_at=time.time(),
+            recommended=result["recommended"],
+            results=result["results"],
+            logs=result["logs"],
+        )
+    except Exception as exc:
+        STRESS_RUN.update(
+            status="failed",
+            finished_at=time.time(),
+            logs=STRESS_RUN.get("logs", []) + [f"压测异常: {exc}"],
+        )
+
+
+@app.get("/api/admin/stress")
+async def admin_stress_status(x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    return {
+        **STRESS_RUN,
+        "busy_tasks": store.pending_task_count(),
+        "running_jobs": len(_running_add_jobs()),
+    }
+
+
+@app.post("/api/admin/stress")
+async def admin_stress_start(body: StressRequest,
+                             x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    if STRESS_RUN.get("status") == "running":
+        raise HTTPException(409, "压力测试正在进行中，请等待完成")
+    busy = store.pending_task_count()
+    if busy:
+        raise HTTPException(
+            409, f"当前有 {busy} 个视频任务在排队/运行，请先等待任务结束再压测"
+        )
+    adding = _running_add_jobs()
+    if adding:
+        raise HTTPException(
+            409, "当前有账号登录任务进行中：" + "、".join(adding[:5])
+        )
+    STRESS_RUN.clear()
+    STRESS_RUN.update(
+        status="running",
+        started_at=time.time(),
+        finished_at=None,
+        recommended=None,
+        results=[],
+        logs=["压力测试开始：从 1 个浏览器逐级加压…"],
+    )
+    asyncio.create_task(_run_stress_job(body.max_concurrency, body.hold_seconds))
+    return {**STRESS_RUN, "busy_tasks": 0, "running_jobs": 0}
 
 
 @app.patch("/api/admin/accounts/{name}")
@@ -848,14 +1008,132 @@ async def admin_account_verify(name: str, x_admin_key: str | None = Header(defau
     return {"ok": ok}
 
 
-async def _run_add_job(name: str, email: str, password: str, totp: str):
+@app.post("/api/admin/accounts/{name}/proxy")
+async def admin_account_proxy_set(name: str, body: AccountProxyBind,
+                                  x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    if name not in pool.accounts:
+        raise HTTPException(404, "account not found")
+    try:
+        set_account_proxy(name, body.proxy_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/api/admin/proxies")
+async def admin_proxies(x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    return {"proxies": list_proxies(), "default_proxy": config.PROXY or ""}
+
+
+@app.post("/api/admin/proxies")
+async def admin_proxy_create(body: ProxyCreate,
+                             x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    try:
+        created = create_proxy(
+            body.name, body.protocol, body.host, body.port,
+            body.username, body.password, body.remark,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"created": created}
+
+
+@app.patch("/api/admin/proxies/{proxy_id}")
+async def admin_proxy_update(proxy_id: str, body: ProxyUpdate,
+                             x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        updated = update_proxy(proxy_id, **fields)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not updated:
+        raise HTTPException(404, "proxy not found")
+    return {"updated": updated}
+
+
+@app.delete("/api/admin/proxies/{proxy_id}")
+async def admin_proxy_delete(proxy_id: str,
+                             x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    delete_proxy(proxy_id)
+    return {"ok": True}
+
+
+@app.get("/api/admin/users")
+async def admin_users(x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    session = ADMIN_SESSIONS.get(x_admin_key or "", {})
+    return {
+        "users": user_list(),
+        "current_username": session.get("username"),
+    }
+
+
+@app.post("/api/admin/users")
+async def admin_user_create(body: AdminUserCreate,
+                            x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    try:
+        created = user_create(
+            body.username, body.password, role=body.role,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"created": created}
+
+
+@app.patch("/api/admin/users/{username}")
+async def admin_user_update(username: str, body: AdminUserUpdate,
+                            x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    try:
+        updated = user_update(
+            username,
+            new_username=body.username,
+            password=body.password,
+            enabled=body.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"updated": updated}
+
+
+@app.delete("/api/admin/users/{username}")
+async def admin_user_delete(username: str,
+                            x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    session = ADMIN_SESSIONS.get(x_admin_key or "", {})
+    if session.get("username") == username:
+        raise HTTPException(400, "不能删除当前登录的账号")
+    try:
+        user_delete(username)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
+async def _run_add_job(name: str, email: str, password: str, totp: str,
+                       cookies: str = "", cookie_skip_verify: bool = False):
     JOBS[name] = {"kind": "add", "status": "running", "email": email,
                   "error": "", "started_at": time.time()}
     try:
         async with ADD_ACCOUNT_SEM:
-            await add_account_flow(name, email, password, totp)
-        pool.set_email(name, email)
-        pool.set_login_status(name, True)
+            if cookies:
+                result = await import_cookie_account(
+                    name, json.loads(cookies),
+                    require_login=not cookie_skip_verify,
+                )
+                pool.set_email(name, email)
+                if result.get("verified"):
+                    pool.set_login_status(name, True)
+            else:
+                await add_account_flow(name, email, password, totp)
+                pool.set_email(name, email)
+                pool.set_login_status(name, True)
         JOBS[name] = {**JOBS[name], "status": "success"}
     except Exception as e:
         JOBS[name] = {**JOBS[name], "status": "failed", "error": str(e)[:300]}
@@ -871,19 +1149,29 @@ async def admin_account_add(body: AccountAdd, x_admin_key: str | None = Header(d
     if JOBS.get(body.name, {}).get("status") == "running":
         raise HTTPException(409, "add job running")
     email = (body.email or "").strip()
-    if not email:
+    cookies = (body.cookies or "").strip()
+    if not email and not cookies:
         raise HTTPException(400, "邮箱不能为空")
-    dups = pool.find_accounts_by_email(email)
-    if dups:
-        raise HTTPException(409, "该邮箱已存在于账号 " + "、".join(dups) + "，请勿重复添加")
-    norm = email.lower()
-    for n, job in JOBS.items():
-        if (job.get("kind") == "add" and job.get("status") == "running"
-                and (job.get("email") or "").strip().lower() == norm):
-            raise HTTPException(409, "该邮箱正在添加中（" + n + "），请勿重复提交")
+    if email:
+        dups = pool.find_accounts_by_email(email)
+        if dups:
+            raise HTTPException(409, "该邮箱已存在于账号 " + "、".join(dups) + "，请勿重复添加")
+        norm = email.lower()
+        for n, job in JOBS.items():
+            if (job.get("kind") == "add" and job.get("status") == "running"
+                    and (job.get("email") or "").strip().lower() == norm):
+                raise HTTPException(409, "该邮箱正在添加中（" + n + "），请勿重复提交")
+    if cookies:
+        try:
+            json.loads(cookies)
+        except Exception:
+            raise HTTPException(422, "cookie JSON 格式错误")
     JOBS[body.name] = {"kind": "add", "status": "running", "email": email,
                        "error": "", "started_at": time.time()}
-    asyncio.create_task(_run_add_job(body.name, email, body.password, body.totp))
+    asyncio.create_task(_run_add_job(
+        body.name, email, body.password, body.totp,
+        cookies=cookies, cookie_skip_verify=body.cookie_skip_verify,
+    ))
     return {"ok": True, "job": "running"}
 
 

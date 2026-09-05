@@ -77,8 +77,9 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
 <div id="loginMask" class="mask" style="display:none">
   <div class="box">
     <h2>管理面板登录</h2>
-    <input id="loginKey" type="password" placeholder="管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
-    <div class="err" id="loginErr">密码错误</div>
+    <input id="loginUser" placeholder="用户名" autocomplete="username" onkeydown="if(event.key==='Enter')q('#loginPassword').focus()">
+    <input id="loginPassword" type="password" placeholder="密码" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitLogin()">
+    <div class="err" id="loginErr">用户名或密码错误</div>
     <button class="btn btn-p" onclick="submitLogin()">登录</button>
   </div>
 </div>
@@ -89,6 +90,7 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
     <label><input type="checkbox" id="autoCk" checked onchange="autoRefresh=this.checked">自动刷新</label>
     <span id="lastUpdate"></span>
     <button class="btn" onclick="refresh()">刷新</button>
+    <button class="btn btn-p" onclick="openStress()">压力测试</button>
     <button class="btn" onclick="logout()" title="清除面板密码">注销</button>
   </div>
 </header>
@@ -96,9 +98,11 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
 <nav>
   <button class="on" data-tab="dash" onclick="switchTab('dash')">仪表盘</button>
   <button data-tab="accounts" onclick="switchTab('accounts')">账号管理</button>
+  <button data-tab="proxies" onclick="switchTab('proxies')">代理管理</button>
   <button data-tab="tasks" onclick="switchTab('tasks')">任务列表</button>
   <button data-tab="videos" onclick="switchTab('videos')">视频管理</button>
   <button data-tab="keys" onclick="switchTab('keys')">API 密钥</button>
+  <button data-tab="users" onclick="switchTab('users')">用户管理</button>
 </nav>
 
 <main>
@@ -119,6 +123,21 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
         </div>
       </div>
       <div id="accountsTable"></div>
+    </div>
+  </section>
+
+  <section id="tab-proxies" style="display:none">
+    <div class="card">
+      <div class="toolbar">
+        <h3 style="margin:0">代理列表</h3>
+        <button class="btn btn-p" onclick="openAddProxy()">＋ 添加代理</button>
+      </div>
+      <div class="hint" style="margin-bottom:12px">
+        可添加多个 HTTP/SOCKS 代理；在“账号管理 → 操作 → 代理”里给每个账号手动选择。
+        未给账号指定代理时，使用环境变量默认代理
+        <span id="defaultProxyShow" style="font-family:monospace"></span>。
+      </div>
+      <div id="proxiesTable"></div>
     </div>
   </section>
 
@@ -148,6 +167,17 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
       </div>
       <div class="hint" style="margin-bottom:12px">每个 Key 可独立设置每日额度、并发数和允许时长；0 表示不限。环境变量里的 key 始终有效、不在此列表。</div>
       <div id="keysTable"></div>
+    </div>
+  </section>
+
+  <section id="tab-users" style="display:none">
+    <div class="card">
+      <div class="toolbar">
+        <h3 style="margin:0">用户管理</h3>
+        <button class="btn btn-p" onclick="openAddUser()">＋ 新增管理员</button>
+      </div>
+      <div class="hint" style="margin-bottom:12px">可增加/删除/修改子管理账号与密码；主账号 admin 不能删除或禁用。</div>
+      <div id="usersTable"></div>
     </div>
   </section>
 </main>
@@ -184,10 +214,13 @@ async function api(path,opts={}){
 
 function showLogin(){hide('dlg');show('loginMask');q('#loginErr').style.display='none';}
 async function submitLogin(){
-  const key=q('#loginKey').value;
-  try{await api('/api/admin/login',{method:'POST',body:{key}});}
+  const username=q('#loginUser').value.trim();
+  const password=q('#loginPassword').value;
+  if(!username||!password){q('#loginErr').style.display='block';return;}
+  let r;
+  try{r=await api('/api/admin/login',{method:'POST',body:{username,password}});}
   catch(e){q('#loginErr').style.display='block';return;}
-  adminKey=key;localStorage.setItem(LS_KEY,key);
+  adminKey=r.token;localStorage.setItem(LS_KEY,r.token);
   hide('loginMask');refresh();
 }
 function logout(){adminKey='';localStorage.removeItem(LS_KEY);showLogin();}
@@ -195,7 +228,7 @@ function logout(){adminKey='';localStorage.removeItem(LS_KEY);showLogin();}
 function switchTab(t){
   curTab=t;
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
-  ['dash','accounts','tasks','videos','keys'].forEach(x=>{q('#tab-'+x).style.display=x===t?'block':'none';});
+  ['dash','accounts','proxies','tasks','videos','keys','users'].forEach(x=>{q('#tab-'+x).style.display=x===t?'block':'none';});
   refresh();
 }
 
@@ -205,9 +238,11 @@ async function refresh(){
   try{
     if(curTab==='dash')await loadDash();
     else if(curTab==='accounts')await loadAccounts();
+    else if(curTab==='proxies')await loadProxies();
     else if(curTab==='tasks')await loadTasks();
     else if(curTab==='videos')await loadVideos();
     else if(curTab==='keys')await loadKeys();
+    else if(curTab==='users')await loadUsers();
   }catch(e){if(e.message!=='unauthorized'){/* 静默 */}}
 }
 
@@ -266,6 +301,7 @@ async function setSched(name,on){
 /* ---- 账号管理 ---- */
 let selAccounts=new Set();
 let allAccountNames=[];
+let proxyCache=[];
 async function loadAccounts(){
   const [a,j]=await Promise.all([api('/api/admin/accounts'),api('/api/admin/jobs')]);
   const jobs=j.jobs||{};
@@ -285,7 +321,9 @@ async function loadAccounts(){
       `<b>${x.remaining}</b> / ${x.limit}`,
       fmt(x.last_used_at),
       fmt(x.created_at),
-      `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">验证</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">删除</button>`
+      `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">验证</button>`+
+      `<button class="btn" style="margin-right:6px" onclick="openSetAccountProxy('${x.name}','${x.proxy_id||''}')">${x.proxy_name?esc(x.proxy_name):'代理(默认)'}</button>`+
+      `<button class="btn btn-danger" onclick="delAccount('${x.name}')">删除</button>`
     ];
   });
   q('#accountsTable').innerHTML=table(
@@ -344,6 +382,22 @@ async function delSelected(){
   selAccounts.clear();
   refresh();
   if(ok)alert(`已删除 ${ok} 个账号`);
+}
+
+async function openSetAccountProxy(name,currentId){
+  try{const r=await api('/api/admin/proxies');proxyCache=r.proxies||[];}catch(e){return alert(e.message);}
+  const opts='<option value="">默认代理（DOLA_PROXY）</option>'+proxyCache.map(p=>
+    `<option value="${esc(p.id)}" ${p.id===currentId?'selected':''}>${esc(p.name)}</option>`).join('');
+  showDlg(`<h2>设置账号代理：${esc(name)}</h2>
+    <p class="tiny">选择该账号验证/出片时使用的代理；留空则使用环境变量默认代理。</p>
+    <select id="f_proxy" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px">${opts}</select>
+    <div class="row"><button class="btn" onclick="hide('dlg')">取消</button>
+      <button class="btn btn-p" onclick="submitSetAccountProxy('${name}')">保存</button></div>`);
+}
+async function submitSetAccountProxy(name){
+  const body={proxy_id:q('#f_proxy').value||null};
+  try{await api('/api/admin/accounts/'+encodeURIComponent(name)+'/proxy',{method:'POST',body});}catch(e){return alert(e.message);}
+  hide('dlg');refresh();
 }
 
 function openBatchAdd(){
@@ -478,9 +532,36 @@ async function submitBatchAdd(){
   refresh();
 }
 
-function openAddAccount(){
+let addMode='google';
+function nextAccName(){
   let def='acc2';try{const n=document.querySelectorAll('#accountsTable tbody tr').length;def='acc'+(n+1);}catch(e){}
-  showDlg(`<h2>添加账号</h2>
+  return def;
+}
+function addModeSwitch(){
+  return `<div style="display:flex;gap:8px;margin-bottom:14px">
+    <button class="btn ${addMode==='google'?'btn-p':''}" onclick="setAddMode('google')">Google 登录</button>
+    <button class="btn ${addMode==='cookie'?'btn-p':''}" onclick="setAddMode('cookie')">Cookie 导入</button>
+  </div>`;
+}
+function setAddMode(m){addMode=m;renderAddAccountForm();}
+function openAddAccount(){addMode='google';renderAddAccountForm();}
+function renderAddAccountForm(){
+  const def=nextAccName();
+  const sw=addModeSwitch();
+  if(addMode==='cookie'){
+    showDlg(`<h2>添加账号</h2>${sw}
+      <label>账号名</label><input id="f_name" value="${def}">
+      <label>Cookie JSON</label>
+      <textarea id="f_cookies" rows="13" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:12px;font-family:ui-monospace,Consolas,monospace;margin-top:4px" placeholder='{"format":"...","cookies":[{"name":"sessionid",...}]}'></textarea>
+      <div class="hint" style="margin-top:6px">粘贴 Cookie-Editor / EditThisCookie 等扩展导出的完整 JSON。</div>
+      <label style="margin-top:10px;display:flex;align-items:flex-start;gap:6px;color:var(--sub)">
+        <input type="checkbox" id="f_skip" style="margin-top:2px;width:auto">
+        <span>跳过在线验证：服务器没有 JP/KR 代理时 dola 会地区限制；勾选后可先导入账号，配好代理后在账号列表点“验证”。</span>
+      </label>
+      <div class="row"><button class="btn" onclick="hide('dlg')">取消</button><button class="btn btn-p" onclick="submitAddCookie()">导入账号</button></div>`);
+    return;
+  }
+  showDlg(`<h2>添加账号</h2>${sw}
     <label>账号名</label><input id="f_name" value="${def}">
     <label>Google 邮箱</label><input id="f_email" placeholder="xxx@yy.asia">
     <label>密码</label><input id="f_pass" type="password">
@@ -492,6 +573,136 @@ async function submitAddAccount(){
   if(!body.name||!body.email||!body.password)return alert('请填写账号名/邮箱/密码');
   try{await api('/api/admin/accounts',{method:'POST',body});}catch(e){return alert(e.message);}
   hide('dlg');refresh();
+}
+async function submitAddCookie(){
+  const body={name:q('#f_name').value.trim(),email:'',password:'',totp:'',cookies:q('#f_cookies').value.trim(),cookie_skip_verify:q('#f_skip').checked};
+  if(!body.name)return alert('请填写账号名');
+  if(!body.cookies)return alert('请粘贴 Cookie JSON');
+  try{JSON.parse(body.cookies);}catch(e){return alert('Cookie JSON 解析失败：'+e.message);}
+  try{await api('/api/admin/accounts',{method:'POST',body});}catch(e){return alert(e.message);}
+  hide('dlg');refresh();
+}
+
+/* ---- 代理管理 ---- */
+function proxyProtocolOptions(sel){
+  return ['http','https','socks4','socks5'].map(p=>
+    `<option value="${p}" ${p===sel?'selected':''}>${p.toUpperCase()}</option>`).join('');
+}
+async function loadProxies(){
+  const r=await api('/api/admin/proxies');
+  proxyCache=r.proxies||[];
+  const dp=q('#defaultProxyShow');if(dp)dp.textContent=r.default_proxy?'（'+r.default_proxy+'）':'（未设置）';
+  q('#proxiesTable').innerHTML=table(
+    ['名称','协议','地址','端口','用户名','已绑账号','备注','操作'],
+    proxyCache.map(p=>[
+      esc(p.name),
+      esc(p.protocol),
+      esc(p.host),
+      p.port,
+      p.username?esc(p.username):'<span class="tiny">—</span>',
+      p.account_count||0,
+      esc(p.remark||'')||'<span class="tiny">—</span>',
+      `<button class="btn" style="margin-right:6px" onclick="openEditProxy('${p.id}')">编辑</button>
+       <button class="btn btn-danger" onclick="delProxy('${p.id}')">删除</button>`
+    ])
+  );
+}
+function proxyDialog(p){
+  const isEdit=!!p;
+  const oldPw=p&&p.has_password?'（原密码已保存，留空保持不变）':'';
+  showDlg(`<h2>${isEdit?'编辑代理':'添加代理'}</h2>
+    <label>名称</label><input id="f_pname" value="${p?esc(p.name):''}" placeholder="例如：日本主代理">
+    <label>协议</label><select id="f_pprotocol" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px">${proxyProtocolOptions(p?p.protocol:'http')}</select>
+    <div style="display:flex;gap:10px"><div style="flex:2"><label>地址</label><input id="f_phost" value="${p?esc(p.host):''}" placeholder="IP 或域名"></div>
+      <div style="flex:1"><label>端口</label><input id="f_pport" type="number" value="${p?p.port:'3128'}"></div></div>
+    <div style="display:flex;gap:10px"><div style="flex:1"><label>用户名（可选）</label><input id="f_puser" value="${p?esc(p.username||''):''}"></div>
+      <div style="flex:1"><label>密码（可选）</label><input id="f_ppass" type="password" placeholder="${oldPw}"></div></div>
+    <label>备注</label><input id="f_premark" value="${p?esc(p.remark||''):''}">
+    <div class="row"><button class="btn" onclick="hide('dlg')">取消</button>
+      <button class="btn btn-p" onclick="submitProxy('${p?p.id:''}')">${isEdit?'保存':'添加'}</button></div>`);
+}
+function openAddProxy(){proxyDialog(null);}
+function openEditProxy(id){const p=proxyCache.find(x=>x.id===id);if(p)proxyDialog(p);}
+async function submitProxy(id){
+  const body={name:q('#f_pname').value.trim(),protocol:q('#f_pprotocol').value,host:q('#f_phost').value.trim(),
+    port:Number(q('#f_pport').value||0),username:q('#f_puser').value,remark:q('#f_premark').value.trim()};
+  if(!body.name||!body.host||!body.port)return alert('请填写名称、地址和端口');
+  const pw=q('#f_ppass').value;
+  if(!id){body.password=pw;}
+  else if(pw){body.password=pw;}
+  try{
+    if(id)await api('/api/admin/proxies/'+encodeURIComponent(id),{method:'PATCH',body});
+    else await api('/api/admin/proxies',{method:'POST',body});
+  }catch(e){return alert(e.message);}
+  hide('dlg');loadProxies();
+}
+async function delProxy(id){
+  const p=proxyCache.find(x=>x.id===id);
+  if(!confirm('删除代理「'+(p?p.name:id)+'」？已绑定该代理的账号会改回默认代理。'))return;
+  try{await api('/api/admin/proxies/'+encodeURIComponent(id),{method:'DELETE'});}catch(e){return alert(e.message);}
+  loadProxies();
+}
+
+/* ---- 用户管理 ---- */
+async function loadUsers(){
+  const r=await api('/api/admin/users');
+  const me=r.current_username||'';
+  q('#usersTable').innerHTML=table(
+    ['用户名','角色','状态','创建时间','操作'],
+    r.users.map(u=>[
+      esc(u.username)+(u.username===me?' <span class="badge b-blue">当前</span>':''),
+      u.role==='owner'?'<span class="badge b-green">主管理员</span>':'<span class="badge b-blue">管理员</span>',
+      u.enabled?'<span class="badge b-green">启用</span>':'<span class="badge b-red">停用</span>',
+      fmt(u.created_at),
+      `<button class="btn" style="margin-right:6px" onclick="openEditUser('${esc(u.username)}')">修改</button>`+
+      `<button class="btn ${u.username===me?'btn':''}" ${u.username===me?'disabled':''} style="margin-right:6px" onclick="delUser('${esc(u.username)}')">删除</button>`
+    ])
+  );
+}
+function openAddUser(){
+  showDlg(`<h2>新增管理员</h2>
+    <label>用户名</label><input id="f_uname" placeholder="仅字母/数字/_/-，最多32位">
+    <label>密码</label><input id="f_upass" type="password" placeholder="初始密码">
+    <div class="row"><button class="btn" onclick="hide('dlg')">取消</button>
+      <button class="btn btn-p" onclick="submitUser('')">新增</button></div>`);
+}
+function openEditUser(username){
+  (async()=>{
+    const r=await api('/api/admin/users');
+    const u=r.users.find(x=>x.username===username);
+    if(!u)return alert('用户不存在');
+    const owner=u.role==='owner';
+    showDlg(`<h2>修改账号：${esc(u.username)}</h2>
+      <label>用户名</label><input id="f_uname" value="${esc(u.username)}" ${owner?'disabled':''} ${owner?'title="主管理员不允许改名"':''}>
+      <label>新密码（留空保持不变）</label><input id="f_upass" type="password" placeholder="留空则不修改">
+      ${owner?'':'<label style="margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--sub)"><input type="checkbox" id="f_uenabled" style="width:auto" '+(u.enabled?'checked':'')+'>启用该账号</label>'}
+      <div class="row"><button class="btn" onclick="hide('dlg')">取消</button>
+        <button class="btn btn-p" onclick="submitUser('${esc(u.username)}')">保存</button></div>`);
+  })();
+}
+async function submitUser(orig){
+  const name=q('#f_uname').value.trim();
+  const pw=q('#f_upass').value;
+  const body={};
+  if(!orig){
+    if(!name||!pw)return alert('请填写用户名和密码');
+    if(!/^[A-Za-z0-9_-]{1,32}$/.test(name))return alert('用户名只能包含字母/数字/_/-，且不超过32位');
+    body.username=name;body.password=pw;
+    try{await api('/api/admin/users',{method:'POST',body});}catch(e){return alert(e.message);}
+  }else{
+    if(!name)return alert('用户名不能为空');
+    if(name!==orig)body.username=name;
+    if(pw)body.password=pw;
+    const eb=q('#f_uenabled');
+    if(eb)body.enabled=eb.checked;
+    try{await api('/api/admin/users/'+encodeURIComponent(orig),{method:'PATCH',body});}catch(e){return alert(e.message);}
+  }
+  hide('dlg');loadUsers();
+}
+async function delUser(username){
+  if(!confirm('确定删除管理员 '+username+'？'))return;
+  try{await api('/api/admin/users/'+encodeURIComponent(username),{method:'DELETE'});}catch(e){return alert(e.message);}
+  loadUsers();
 }
 
 /* ---- 任务列表 ---- */
@@ -701,6 +912,59 @@ async function copy(text){
 }
 
 function showDlg(html){q('#dlgBox').innerHTML=html;show('dlg');}
+
+/* ---- 压力测试 ---- */
+let stressPollTimer=null;
+function stopStressPoll(){if(stressPollTimer){clearInterval(stressPollTimer);stressPollTimer=null;}}
+function openStress(){
+  showDlg(`<h2>压力测试</h2>
+    <p class="tiny" style="line-height:1.7;margin-bottom:10px">模拟“多个账号/视频任务同时拉起浏览器”：服务器会从 1 个开始，
+    逐级同时拉起 1、2、3…N 个 headed Chromium（临时 profile，使用与账号登录相同的浏览器参数；
+    不访问 Google/dola，不消耗任何号池额度），并统计操作系统里真实拉起的浏览器主进程数、
+    Chromium 总进程数、内存峰值和系统剩余内存，得出当前可稳定并发的浏览器数。</p>
+    <label>最大测试级数（默认 8，最大 12）</label>
+    <input id="stressMax" type="number" min="1" max="12" value="8">
+    <div class="hint" style="margin-top:4px">测试期间请不要同时进行真实账号登录/视频任务。</div>
+    <div id="stressOut" class="tiny" style="margin-top:10px;white-space:pre-wrap;max-height:230px;overflow:auto;background:#f5f7f6;border-radius:8px;padding:10px"></div>
+    <div class="row"><button class="btn" onclick="stopStressPoll();hide('dlg')">关闭</button>
+      <button class="btn btn-p" id="stressStartBtn" onclick="startStress()">开始压测</button></div>`);
+  loadStressStatus(true);
+}
+async function loadStressStatus(showLogs){
+  try{
+    const st=await api('/api/admin/stress');
+    const out=q('#stressOut');if(!out)return;
+    const lines=[];
+    if(st.busy_tasks>0)lines.push('⚠ 当前有 '+st.busy_tasks+' 个视频任务在排队/运行，压测会被拒绝，建议等空闲后再试。');
+    if(st.running_jobs>0)lines.push('⚠ 当前有账号登录任务进行中，压测会被拒绝。');
+    if(st.status==='running'){
+      lines.push('压测运行中，正在逐级拉起浏览器…请稍候');
+      if(st.logs&&st.logs.length)lines.push('---\n'+st.logs.join('\n'));
+      const btn=q('#stressStartBtn');if(btn)btn.disabled=true;
+    }else{
+      if(stressPollTimer){clearInterval(stressPollTimer);stressPollTimer=null;}
+      const btn=q('#stressStartBtn');if(btn)btn.disabled=false;
+      if(st.status==='completed'){
+        lines.push('✅ 推荐并发：'+st.recommended+' 个浏览器');
+        if(st.logs&&st.logs.length)lines.push('---\n'+st.logs.join('\n'));
+      }else if(st.status==='failed'){
+        if(st.logs&&st.logs.length)lines.push('压测失败：\n'+st.logs.join('\n'));
+      }else if(showLogs&&st.logs&&st.logs.length){
+        lines.push(st.logs.join('\n'));
+      }
+    }
+    out.textContent=lines.join('\n');
+  }catch(e){}
+}
+async function startStress(){
+  const btn=q('#stressStartBtn');btn.disabled=true;
+  const n=Math.min(12,Math.max(1,parseInt(q('#stressMax').value||'8',10)));
+  try{
+    await api('/api/admin/stress',{method:'POST',body:{max_concurrency:n,hold_seconds:5}});
+    q('#stressOut').textContent='压测已开始：1→'+n+' 个浏览器逐级同时拉起…';
+    stressPollTimer=setInterval(()=>loadStressStatus(false),2500);
+  }catch(e){alert(e.message);btn.disabled=false;}
+}
 
 /* 启动：探测鉴权，401 才弹登录遮罩（ADMIN_KEY 留空时免登录） */
 (async function boot(){
